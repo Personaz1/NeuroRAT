@@ -200,45 +200,61 @@ class GoogleAIIntegration(APIIntegration):
             # Добавляем историю сообщений
             if history:
                  logger.debug(f"Processing message history for Gemini (length: {len(history)})")
+                 processed_contents = [] # Используем новый список для корректного формирования
                  for msg in history:
                      role = msg.get("role")
-                     content = msg.get("content", "")
-                     # Gemini ожидает чередования user/model ролей.
-                     # Роль 'system' обрабатывается отдельно.
-                     # Роль 'tool' преобразуем в 'user' сообщение с описанием результата.
+                     # parts = msg.get("parts", []) # Gemini ожидает parts
+                     # content = parts[0].get("text") if parts else "" # Извлекаем текст из parts
+                     # --- ИЗМЕНЕНИЕ: Работаем с форматом history из C1Brain --- 
+                     content = msg.get("content") # C1Brain пока передает content, не parts
+                     if not content:
+                         # Если content пустой, проверяем parts (на всякий случай)
+                         parts = msg.get("parts", [])
+                         content = parts[0].get("text") if parts and isinstance(parts, list) and len(parts) > 0 and isinstance(parts[0], dict) else "" 
+                     # --------------------------------------------------------
+
                      gemini_role = ""
                      if role == "user":
                          gemini_role = "user"
-                     elif role == "agent" or role == "assistant":
-                         gemini_role = "model" # Gemini использует 'model' для ответов ассистента
+                     # --- ИЗМЕНЕНИЕ: Добавляем обработку роли 'model' --- 
+                     elif role == "agent" or role == "assistant" or role == "model": 
+                         gemini_role = "model"
+                     # --------------------------------------------------
                      elif role == "tool":
-                         gemini_role = "user" # Представляем результат инструмента как сообщение пользователя
+                         # Представляем результат инструмента как function response (более правильно для Gemini?)
+                         # Или оставляем как user message? Оставляем пока user для простоты.
+                         gemini_role = "user" 
                          content = f"[Tool Execution Result]\n{content}"
                          logger.debug(f"Adding tool result to contents as user message: {content[:100]}...")
-                     elif role == "system": # Системные сообщения уже обработаны
+                     elif role == "system":
                         continue
                      else:
                         logger.warning(f"Unknown role in history: {role}. Skipping.")
                         continue
                         
-                     # Проверяем, чтобы не было двух user/model подряд (Gemini API требует чередования)
-                     if contents and contents[-1]["role"] == gemini_role:
-                        # Если роли совпадают, это может вызвать ошибку. Пробуем пропустить?
-                        # Или можно попробовать объединить контент, но это усложнит.
-                        # Пока просто пропускаем, чтобы избежать ошибки API.
-                        logger.warning(f"Skipping message due to consecutive roles: {role} following {contents[-1]['role']}")
-                        continue
+                     # --- ИЗМЕНЕНИЕ: Убираем пропуск из-за последовательных ролей --- 
+                     # TODO: Если Gemini API будет ругаться на последовательные роли,
+                     #       нужно будет добавить более сложную логику слияния/удаления.
+                     # if processed_contents and processed_contents[-1]["role"] == gemini_role:
+                     #    logger.warning(f"Skipping message due to consecutive roles: {role} following {processed_contents[-1]['role']}")
+                     #    continue
+                     # ------------------------------------------------------------
                         
-                     contents.append({"role": gemini_role, "parts": [{"text": content}]})
+                     # --- ИЗМЕНЕНИЕ: Используем parts --- 
+                     processed_contents.append({"role": gemini_role, "parts": [{"text": content if content is not None else ""}]}) # Убедимся, что текст не None
+                 
+                 contents.extend(processed_contents) # Добавляем обработанную историю
             
-            # Добавляем последний промпт пользователя
+            # Добавляем последний промпт пользователя (если он есть и не дублирует роль)
             if prompt:
-                # Убедимся, что последняя роль не 'user'
-                if contents and contents[-1]["role"] == "user":
-                    logger.warning("Skipping final user prompt due to consecutive user roles.")
-                else:
+                # --- ИЗМЕНЕНИЕ: Упрощенная проверка последней роли --- 
+                if not contents or contents[-1]["role"] != "user":
                     contents.append({"role": "user", "parts": [{"text": prompt}]})
                     logger.debug("Adding final user prompt to contents.")
+                else:
+                     # Если последняя роль 'user', возможно, стоит объединить или заменить?
+                     # Пока что пропускаем, как и было, но с логгированием.
+                     logger.warning("Skipping final user prompt due to consecutive user roles after history processing.")
             
             if not contents:
                  logger.error("Cannot send request to Gemini: no contents generated.")

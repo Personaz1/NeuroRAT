@@ -1533,50 +1533,68 @@ class C1Brain:
         if history is None:
             history = []
 
+        # Добавляем изначальный промпт пользователя в историю, если его еще нет
+        # (Важно для корректной передачи контекста в Gemini API)
+        if not history or history[-1].get("role") != "user":
+             history.append({"role": "user", "parts": [{"text": prompt}]})
+        elif history[-1].get("role") == "user":
+             # Если последний - user, обновляем его (или добавляем, если промпт другой?)
+             # Пока что предполагаем, что prompt - это НОВЫЙ запрос, поэтому добавляем.
+             # TODO: Пересмотреть логику, если prompt - это просто повторный вызов для продолжения.
+             history.append({"role": "user", "parts": [{"text": prompt}]})
+
+
+        max_steps = 100 # Максимальное количество шагов reasoning
+        current_step = 0
+        last_agent_response = "" # Храним последний ответ агента
+
         try:
-            # Шаг 1: Первый вызов LLM с промптом и историей
-            first_response = self._query_llm(prompt, history=history)
-            logger.debug(f"LLM first response: {first_response[:500]}...")
+            while current_step < max_steps:
+                current_step += 1
+                logger.info(f"Reasoning Step {current_step}/{max_steps}")
 
-            # Добавляем ответ LLM (потенциально с вызовом инструмента) в историю для следующего шага
-            history.append({"role": "agent", "content": first_response})
+                # Шаг 1: Вызов LLM с текущей историей
+                # Передаем пустой промпт, так как вся логика уже в истории
+                current_llm_response = self._query_llm("", history=history)
+                logger.debug(f"LLM response (Step {current_step}): {current_llm_response[:500]}...")
 
-            # Шаг 2: Поиск вызова инструмента в ответе LLM
-            tool_call_match = re.search(r"\[TOOL_CALL:\s*(\w+)\((.*?)\)\s*\]", first_response)
+                # Добавляем ответ LLM в историю
+                # Важно использовать role 'model' для Gemini API
+                history.append({"role": "model", "parts": [{"text": current_llm_response}]})
+                last_agent_response = current_llm_response # Обновляем последний ответ агента
 
-            if tool_call_match:
-                tool_name = tool_call_match.group(1)
-                tool_args_str = tool_call_match.group(2)
-                logger.info(f"Detected tool call: {tool_name} with args: {tool_args_str}")
+                # Шаг 2: Поиск вызова инструмента в *последнем* ответе LLM
+                tool_call_match = re.search(r"\[TOOL_CALL:\s*(\w+)\((.*?)\)\s*\]", current_llm_response)
 
-                # Шаг 3: Выполнение инструмента
-                tool_result = await self._execute_tool(tool_name, tool_args_str)
-                tool_result_str = json.dumps(tool_result, ensure_ascii=False)
-                logger.info(f"Tool {tool_name} result: {tool_result_str}")
+                if tool_call_match:
+                    tool_name = tool_call_match.group(1)
+                    tool_args_str = tool_call_match.group(2)
+                    logger.info(f"Detected tool call: {tool_name} with args: {tool_args_str}")
 
-                # Шаг 4: Второй вызов LLM с результатом инструмента
-                # Передаем исходный промпт, историю (включая первый ответ LLM) и результат инструмента
-                # Формируем новый "промпт", который включает результат вызова инструмента
-                tool_prompt = f"Tool {tool_name} executed. Result:\n```json\n{tool_result_str}\n```\nBased on this result, provide the final response to the user."
-                
-                # Добавляем сообщение о результате инструмента в историю
-                history.append({"role": "tool", "content": tool_result_str})
-                
-                # Вызываем LLM еще раз. Передаем пустой промпт, т.к. контекст уже в истории.
-                final_response = self._query_llm("", history=history)
-                logger.info(f"LLM final response after tool call generated.")
-                # ЛОГИРУЕМ СОДЕРЖАНИЕ ФИНАЛЬНОГО ОТВЕТА
-                logger.debug("TEST DEBUG LOG BEFORE FINAL RESPONSE") # Тестовый лог
-                logger.debug(f"Final LLM response content: {final_response}") 
-                return final_response
-            else:
-                # Если вызова инструмента нет, возвращаем первый ответ LLM
-                logger.info("No tool call detected in LLM response.")
-                return first_response
+                    # Шаг 3: Выполнение инструмента
+                    tool_result = await self._execute_tool(tool_name, tool_args_str)
+                    tool_result_str = json.dumps(tool_result, ensure_ascii=False)
+                    logger.info(f"Tool {tool_name} result: {tool_result_str}")
+
+                    # Шаг 4: Добавление результата инструмента в историю
+                    # Используем role 'tool' для Gemini API
+                    history.append({"role": "tool", "parts": [{"text": tool_result_str}]})
+                    # Продолжаем цикл для следующего шага reasoning
+
+                else:
+                    # Если вызова инструмента нет, завершаем цикл
+                    logger.info("No tool call detected in last LLM response. Ending reasoning loop.")
+                    break # Выход из цикла while
+            
+            if current_step >= max_steps:
+                 logger.warning(f"Reasoning loop reached maximum steps ({max_steps}).")
+
+            # Возвращаем самый последний ответ агента
+            return last_agent_response
 
         except Exception as e:
-            logger.error(f"Error processing chat in C1Brain: {e}", exc_info=True)
-            return f"Ошибка в C1Brain при обработке чата: {e}"
+            logger.error(f"Error processing chat in C1Brain multi-step loop: {e}", exc_info=True)
+            return f"Ошибка в C1Brain при обработке многошагового чата: {e}"
 
     async def _execute_tool(self, tool_name: str, args_str: str) -> Dict[str, Any]:
         """Выполняет указанный инструмент с аргументами."""

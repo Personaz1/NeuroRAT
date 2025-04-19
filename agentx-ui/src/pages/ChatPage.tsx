@@ -34,36 +34,47 @@ const ChatPage: React.FC = () => {
   // Обработчик отправки сообщения пользователем
   const handleSendMessage = useCallback(
     async (userMessage: string) => {
-      const userMsgObject: Message = {
-          id: crypto.randomUUID(),
+      const userMsgObject: Omit<Message, 'id' | 'timestamp'> = {
           role: 'user',
           content: userMessage,
-          timestamp: Date.now(),
       };
-      // Добавляем сообщение пользователя локально сразу
-      setMessages((prevMessages) => [...prevMessages, userMsgObject]);
+
+      // 1. Готовим отфильтрованную историю ПЕРЕД обновлением состояния
+      let historyForApi: { role: string; content: string }[] = [];
+      setMessages(prevMessages => {
+          // Фильтруем ПРЕДЫДУЩИЕ сообщения + НОВОЕ сообщение пользователя
+          const messagesToSend = [
+              ...prevMessages,
+              { ...userMsgObject, id: 'temp-user', timestamp: Date.now() } // Добавляем временное новое сообщение
+          ];
+          historyForApi = messagesToSend
+              .filter(msg =>
+                  msg.role !== 'system' &&
+                  (includeTerminalHistory || !['terminal_input', 'terminal_output'].includes(msg.role))
+              )
+              .map(({ role, content }) => ({ role, content }));
+          // Обновляем состояние, добавляя НОВОЕ сообщение пользователя (уже без фильтрации)
+          return [
+              ...prevMessages,
+              {
+                  ...userMsgObject,
+                  id: crypto.randomUUID(),
+                  timestamp: Date.now(),
+              },
+          ];
+      });
+
+      // 2. Вызываем API с подготовленной И ПРАВИЛЬНО отфильтрованной историей
       setIsLoading(true);
-
-      // Формируем историю для отправки (только role и content)
-      // Фильтруем сообщения: убираем системные и терминальные, если чекбокс выключен
-      const historyForApi = messages
-        .concat(userMsgObject) // Добавляем текущее сообщение пользователя в историю для API
-        .filter(msg =>
-            msg.role !== 'system' && // Убираем системные сообщения
-            (includeTerminalHistory || !['terminal_input', 'terminal_output'].includes(msg.role)) // Убираем терминальные, если не включено
-        )
-        .map(({ role, content }) => ({ role, content })); // Оставляем только role и content
-
       try {
-        // Отправляем запрос на бэкенд, включая отфильтрованную историю
+        // Отправляем запрос на бэкенд
         const response = await axios.post(`${API_BASE_URL}/api/chat`, {
           prompt: userMessage, // Оставляем последнее сообщение как prompt
           mode: 'STANDARD',
-          history: historyForApi, // Передаем отфильтрованную историю
+          history: historyForApi, // <--- Используем ПРАВИЛЬНУЮ историю
         });
 
         if (response.data && response.data.content) {
-          // Используем addMessage для добавления ответа агента
           addMessage({ role: 'agent', content: response.data.content });
         } else {
            addMessage({ role: 'system', content: 'Получен пустой ответ от агента.' });
@@ -78,13 +89,12 @@ const ChatPage: React.FC = () => {
              errorMessage += ` (Статус: ${error.response.status})`;
           }
         }
-        // Используем addMessage для добавления системного сообщения об ошибке
         addMessage({ role: 'system', content: errorMessage });
       } finally {
         setIsLoading(false);
       }
     },
-    [addMessage, messages, includeTerminalHistory] // Добавляем includeTerminalHistory в зависимости
+    [addMessage, includeTerminalHistory] // Зависимости корректны
   );
 
   // Обработчик для действий из терминала
