@@ -3,7 +3,7 @@ import MessageList, { Message } from '../components/Chat/MessageList';
 import InputPanel from '../components/Chat/InputPanel';
 import TerminalPanel from '../components/Terminal/TerminalPanel';
 import ReasoningPanel from '../components/ReasoningPanel/ReasoningPanel';
-import { Tabs, Tab, Box, IconButton, Typography } from '@mui/material';
+import { Tabs, Tab, Box, IconButton, Typography, Button } from '@mui/material';
 import PhotoCamera from '@mui/icons-material/PhotoCamera';
 
 const API_BASE_URL = 'http://localhost:8000'; // URL нашего бэкенда
@@ -133,7 +133,7 @@ const ChatPage: React.FC = () => {
       let historyForApi: { role: string; content: string }[] = [];
       setMessages(prevMessages => {
           // Формируем историю для API: предыдущие сообщения, изображение (если есть), новое сообщение
-          let messagesForHistory = [...prevMessages];
+          const messagesForHistory = [...prevMessages];
           if (pendingImage) {
             messagesForHistory.push({ role: 'user', content: `![изображение](${pendingImage.url})`, id: 'temp-img', timestamp: Date.now() });
           }
@@ -224,6 +224,17 @@ const ChatPage: React.FC = () => {
     [addMessage]
   );
 
+  // Обработчик очистки истории чата
+  const handleClearHistory = useCallback(() => {
+    const initial: Message = { id: 'system-start', role: 'system', content: 'Сессия чата начата. Готов к работе.', timestamp: Date.now() };
+    setMessages([initial]);
+    try {
+      localStorage.removeItem('chat_messages');
+    } catch {
+      // ignore errors when clearing storage
+    }
+  }, []);
+
   // --- СТИЛИ ---
   const chatPageStyle: React.CSSProperties = {
     display: 'flex',       // Используем Flexbox
@@ -273,91 +284,97 @@ const ChatPage: React.FC = () => {
     <div style={chatPageStyle}>
        {/* Левая часть: Чат */}
       <div style={chatAreaStyle}>
-          {/* Превью загруженного изображения (до отправки) */}
-          {pendingImage && (
-            <Box sx={{ p: 1, textAlign: 'center' }}>
-              <img src={pendingImage.url} style={{ maxWidth: '100%', maxHeight: '200px' }} alt="Preview" />
-            </Box>
-          )}
-          <div style={messageListContainerStyle}>
-              {/* Drop files here or click button below to upload image */}
-              <div
-                onDragOver={e => e.preventDefault()}
-                onDrop={e => {
-                  e.preventDefault();
-                  const file = e.dataTransfer.files[0];
-                  if (file && file.type.startsWith('image/')) {
-                    // reuse handleImageUpload logic
-                    const fakeEvent = ({ target: { files: [file] } } as unknown) as React.ChangeEvent<HTMLInputElement>;
-                    handleImageUpload(fakeEvent);
-                  }
-                }}
-                style={{ border: '2px dashed #555', borderRadius: '4px', padding: '20px', textAlign: 'center', marginBottom: '10px', color: '#777' }}
-              >
-                Перетащите изображение сюда
-              </div>
-              <MessageList messages={messages} loading={isLoading} />
-          </div>
-          <InputPanel onSendMessage={handleSendMessage} loading={isLoading} />
-          {/* Кнопка для выбора изображения */}
-          <Box sx={{ display: 'flex', alignItems: 'center', p: 1, borderTop: 1, borderColor: 'divider' }}>
-            <input
-              accept="image/*"
-              id="image-upload-input"
-              type="file"
-              style={{ display: 'none' }}
-              onChange={handleImageUpload}
-            />
-            <label htmlFor="image-upload-input">
-              <IconButton color="primary" component="span">
-                <PhotoCamera />
-              </IconButton>
-            </label>
-            <Typography variant="body2" sx={{ ml: 1, color: 'text.secondary' }}>
-              Добавить изображение
-            </Typography>
+        {/* Кнопка очистки истории чата */}
+        <Box sx={{ p: 1, display: 'flex', justifyContent: 'flex-end' }}>
+          <Button variant="outlined" size="small" color="secondary" onClick={handleClearHistory}>
+            Очистить историю
+          </Button>
+        </Box>
+        {/* Превью загруженного изображения (до отправки) */}
+        {pendingImage && (
+          <Box sx={{ p: 1, textAlign: 'center' }}>
+            <img src={pendingImage.url} style={{ maxWidth: '100%', maxHeight: '200px' }} alt="Preview" />
           </Box>
-      </div>
-
-      {/* Правая часть: Табы с цепочкой рассуждений и терминалом */}
-      <div style={rightAreaStyle}>
-          <Tabs 
-            value={activeTab} 
-            onChange={handleTabChange} 
-            aria-label="Панели инструментов"
-            sx={{ borderBottom: 1, borderColor: 'divider' }}
-          >
-            <Tab label="Рассуждения" />
-            <Tab label="Терминал" />
-          </Tabs>
-          
-          {/* Вкладка с цепочкой рассуждений */}
-          <TabPanel value={activeTab} index={0}>
-            <ReasoningPanel messages={messages} />
-          </TabPanel>
-          
-          {/* Вкладка с терминалом */}
-          <TabPanel value={activeTab} index={1}>
-            <div style={terminalHeaderStyle}>
-              <input
-                type="checkbox"
-                id="includeTerminal"
-                checked={includeTerminalHistory}
-                onChange={(e) => setIncludeTerminalHistory(e.target.checked)}
-                style={{ marginRight: '8px' }}
-              />
-              <label htmlFor="includeTerminal" style={{ cursor: 'pointer' }}>
-                Включить историю терминала в контекст LLM
-              </label>
+        )}
+        <div style={messageListContainerStyle}>
+            {/* Drop files here or click button below to upload image */}
+            <div
+              onDragOver={e => e.preventDefault()}
+              onDrop={e => {
+                e.preventDefault();
+                const file = e.dataTransfer.files[0];
+                if (file && file.type.startsWith('image/')) {
+                  // reuse handleImageUpload logic
+                  const fakeEvent = ({ target: { files: [file] } } as unknown) as React.ChangeEvent<HTMLInputElement>;
+                  handleImageUpload(fakeEvent);
+                }
+              }}
+              style={{ border: '2px dashed #555', borderRadius: '4px', padding: '20px', textAlign: 'center', marginBottom: '10px', color: '#777' }}
+            >
+              Перетащите изображение сюда
             </div>
-            {/* flexGrow: 1 нужен контейнеру вокруг TerminalPanel, чтобы он растянулся */}
-            <div style={{ flexGrow: 1, overflow: 'hidden', height: 'calc(100% - 40px)' }}>
-              <TerminalPanel onTerminalAction={handleTerminalAction} />
-            </div>
-          </TabPanel>
-      </div>
+            <MessageList messages={messages} loading={isLoading} />
+        </div>
+        <InputPanel onSendMessage={handleSendMessage} loading={isLoading} />
+        {/* Кнопка для выбора изображения */}
+        <Box sx={{ display: 'flex', alignItems: 'center', p: 1, borderTop: 1, borderColor: 'divider' }}>
+          <input
+            accept="image/*"
+            id="image-upload-input"
+            type="file"
+            style={{ display: 'none' }}
+            onChange={handleImageUpload}
+          />
+          <label htmlFor="image-upload-input">
+            <IconButton color="primary" component="span">
+              <PhotoCamera />
+            </IconButton>
+          </label>
+          <Typography variant="body2" sx={{ ml: 1, color: 'text.secondary' }}>
+            Добавить изображение
+          </Typography>
+        </Box>
     </div>
-  );
+
+    {/* Правая часть: Табы с цепочкой рассуждений и терминалом */}
+    <div style={rightAreaStyle}>
+        <Tabs 
+          value={activeTab} 
+          onChange={handleTabChange} 
+          aria-label="Панели инструментов"
+          sx={{ borderBottom: 1, borderColor: 'divider' }}
+        >
+          <Tab label="Рассуждения" />
+          <Tab label="Терминал" />
+        </Tabs>
+        
+        {/* Вкладка с цепочкой рассуждений */}
+        <TabPanel value={activeTab} index={0}>
+          <ReasoningPanel messages={messages} />
+        </TabPanel>
+        
+        {/* Вкладка с терминалом */}
+        <TabPanel value={activeTab} index={1}>
+          <div style={terminalHeaderStyle}>
+            <input
+              type="checkbox"
+              id="includeTerminal"
+              checked={includeTerminalHistory}
+              onChange={(e) => setIncludeTerminalHistory(e.target.checked)}
+              style={{ marginRight: '8px' }}
+            />
+            <label htmlFor="includeTerminal" style={{ cursor: 'pointer' }}>
+              Включить историю терминала в контекст LLM
+            </label>
+          </div>
+          {/* flexGrow: 1 нужен контейнеру вокруг TerminalPanel, чтобы он растянулся */}
+          <div style={{ flexGrow: 1, overflow: 'hidden', height: 'calc(100% - 40px)' }}>
+            <TerminalPanel onTerminalAction={handleTerminalAction} />
+          </div>
+        </TabPanel>
+    </div>
+  </div>
+);
 };
 
 export default ChatPage; 
