@@ -128,6 +128,11 @@ const MessageList: React.FC<MessageListProps> = ({ messages, loading }) => { // 
             <ReactMarkdown
               rehypePlugins={[rehypeHighlight]}
               components={{
+                img({ node, ...props }) {
+                  const src = props.src as string;
+                  if (!src || !src.startsWith('blob:')) return null;
+                  return <img {...props} style={{ maxWidth: '100%', borderRadius: '6px' }} />;
+                },
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 code({ inline, className, children, ...props }: any) {
                   const match = /language-(\w+)/.exec(className || '');

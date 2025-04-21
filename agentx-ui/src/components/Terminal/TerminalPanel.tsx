@@ -3,7 +3,6 @@ import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { useXTerm } from 'react-xtermjs'; // Импортируем хук
 import { ITerminalOptions } from '@xterm/xterm'; // Убираем импорт Terminal
 import '@xterm/xterm/css/xterm.css';
-import axios from 'axios';
 
 const API_BASE_URL = 'http://localhost:8000';
 
@@ -31,38 +30,41 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ onTerminalAction }) => {
         onTerminalAction('input', command);
     }
 
-    let output = '';
-    let errorMessage = '';
-
     try {
-      const response = await axios.post<{ output: string, error?: string }>(`${API_BASE_URL}/api/terminal/execute`, { command });
-      // Проверяем наличие ошибки в ответе API
-      if (response.data.error) {
-          errorMessage = response.data.error;
-      } else {
-         output = response.data.output.replace(/^\r?\n/, ''); // Убираем начальный перенос
-      }
-      
-      // Заменяем все переносы на \r\n для корректного отображения
-      const displayOutput = output ? output.replace(/\n/g, '\r\n') : `Error: ${errorMessage}`;
-      instance.write(displayOutput);
-
+      // Используем SSE через EventSource GET endpoint для реального стриминга
+      const sseUrl = `${API_BASE_URL}/api/terminal/stream?command=${encodeURIComponent(command)}`;
+      const source = new EventSource(sseUrl);
+      source.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.done) {
+            source.close();
+            instance.write('\r\n$ ');
+            commandRef.current = '';
+            setIsLoading(false);
+          } else if (payload.output) {
+            const text = payload.output.replace(/\n/g, '\r\n');
+            instance.write(text);
+            if (onTerminalAction) onTerminalAction('output', payload.output);
+          }
+        } catch {
+          // игнорируем некорректные данные
+        }
+      };
+      source.onerror = () => {
+        instance.write('\r\nError streaming command');
+        source.close();
+        setIsLoading(false);
+      };
     } catch (error) {
-      console.error("Error sending command:", error);
-      errorMessage = axios.isAxiosError(error) ? error.message : 'Unknown error';
-      instance.write(`\r\nError: ${errorMessage}`);
-    } finally {
-       // Вызываем колбэк для вывода команды (или ошибки)
-       if (onTerminalAction) {
-           const contentToSend = errorMessage ? `Error: ${errorMessage}` : output;
-           onTerminalAction('output', contentToSend);
-       }
-      instance.write('\r\n$ '); // Промпт после выполнения
-      commandRef.current = ''; // Сбрасываем команду в ref
-      // setCurrentCommand(''); // Удаляем установку неиспользуемого state
+      const errMsg = error instanceof Error ? error.message : String(error);
+      instance.write(`\r\nError: ${errMsg}`);
+      if (onTerminalAction) onTerminalAction('output', `Error: ${errMsg}`);
+      instance.write('\r\n$ ');
+      commandRef.current = '';
       setIsLoading(false);
     }
-  }, [instance, onTerminalAction]); // Добавляем onTerminalAction в зависимости
+  }, [instance, onTerminalAction]);
 
   // Настраиваем терминал и подписку на onData один раз
   useEffect(() => {
