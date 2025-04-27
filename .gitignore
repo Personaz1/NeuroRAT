@@ -1,8 +1,9 @@
+# Ignore environment files
 agentx-c1/.env
-Dev_Notes.md
-DEV_NOTES.md
-secret_dev_notes.md
-CLAUDE_CODING_BEST_PRACTICES.md
+# CLAUDE coding best practices
+# CLAUDE_CODING_BEST_PRACTICES.md
+# Legacy notes are now tracked
+# [Removed ignored DEV_NOTES to commit updates]
 # Игнорировать папку с устаревшими файлами (legacy)
 OLD FILES (ANALIZE&Intagrate))/
 .cursor/
