@@ -16,6 +16,7 @@ import types
 import marshal
 import zlib
 import time
+import logging
 from typing import Dict, List, Any, Optional, Callable, Tuple, Union
 from common.utils import get_logger
 
@@ -157,20 +158,21 @@ class PolyMorpher:
         # Вставляем код декодирования строк
         decode_prefix = ''.join(string_replacements)
         
-        # Переименовываем функции и классы
-        def_pattern = r'\b(def|class)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b'
-        
+        # Переименовываем функции и классы (с сохранением отображения для вызовов)
+        def_pattern = r"\b(def|class)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b"
+        name_map: Dict[str, str] = {}
         def replace_def(match):
             keyword, name = match.groups()
-            
             # Не переименовываем специальные методы
             if name.startswith('__') and name.endswith('__'):
                 return match.group(0)
-            
             new_name = self._generate_variable_name(name[:2])
+            name_map[name] = new_name
             return f"{keyword} {new_name}"
-        
         transformed_code = re.sub(def_pattern, replace_def, transformed_code)
+        # Обновляем все вызовы функций и классов по сохраненному отображению
+        for orig_name, new_name in name_map.items():
+            transformed_code = re.sub(rf"\b{orig_name}\b", new_name, transformed_code)
         
         # Добавляем мертвый код и мусорные переменные
         junk_code = []
@@ -245,7 +247,8 @@ def {self._generate_variable_name('handler')}(func):
 # {self._generate_random_id(30)}
 """
         
-        return prologue + '\n'.join(lines) + '\n' + epilogue
+        # Гарантируем разделение пролога и основного кода
+        return prologue + '\n' + '\n'.join(lines) + '\n' + epilogue
     
     def transform_module(self, module_path: str) -> str:
         """

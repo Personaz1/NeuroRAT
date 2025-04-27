@@ -12,3 +12,7 @@ OLD FILES (ANALIZE&Intagrate))/
 *.pyc
 *.log
 .env
+# Игнорировать локальные заметки разработки
+Dev_Notes.md
+DEV_NOTES.md
+secret_dev_notes.md
