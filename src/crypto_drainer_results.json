@@ -1,0 +1,35 @@
+{
+  "wallets": {
+    "metamask": [
+      {
+        "path": "/Users/stefan/Library/Application Support/Google/Chrome/Default/Local Extension Settings/nkbihfbeogaeaoehlefnkodbefgpgknn",
+        "size": 30021870,
+        "access_time": "Sun Apr 27 12:01:57 2025",
+        "modification_time": "Sun Apr 27 11:59:51 2025",
+        "files": [],
+        "wallet_type": "metamask"
+      }
+    ],
+    "exodus": [
+      {
+        "path": "/Users/stefan/Library/Application Support/Exodus",
+        "size": 9804138,
+        "access_time": "Mon Sep 23 15:35:55 2024",
+        "modification_time": "Wed Jul 17 10:58:57 2024",
+        "files": [
+          "/Users/stefan/Library/Application Support/Exodus/exodus.conf.json",
+          "/Users/stefan/Library/Application Support/Exodus/announcements.json",
+          "/Users/stefan/Library/Application Support/Exodus/window-state.json",
+          "/Users/stefan/Library/Application Support/Exodus/market-history-cache.json",
+          "/Users/stefan/Library/Application Support/Exodus/exodus.wallet/seed.seco",
+          "/Users/stefan/Library/Application Support/Exodus/exodus.wallet/unsafe-storage.json"
+        ],
+        "wallet_type": "exodus"
+      }
+    ]
+  },
+  "private_keys": [],
+  "seed_phrases": [],
+  "timestamp": 1745748117.650764,
+  "platform": "macOS-14.5-arm64-arm-64bit"
+}
