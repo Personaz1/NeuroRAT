@@ -1,0 +1,108 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,amsthm,graphicx}
+\title{Convergence of a Discrete Ricci--Torus Flow with Surgery}
+\author{<<YOUR NAME>>}
+\date{\today}
+
+\newtheorem{thm}{Theorem}
+\newtheorem{lem}{Lemma}
+\DeclareMathOperator{\sgn}{sgn}
+
+\begin{document}\maketitle
+
+\section{Setup}
+Let $G_t=(V_t,E_t)$ be a finite, simple, connected graph after
+iteration~$t$.  
+For an edge $e=(u,v)$ the \emph{Ollivier--Ricci curvature} (lazy walk,
+weight $\frac12$) is
+\[
+\kappa_t(e)=1-\frac{W_1(\mu_u,\mu_v)}{d(u,v)}.
+\]
+Angles $(\theta_i,\varphi_i)\in S^1\times S^1$ are assigned to each
+vertex by the PCA--torus map; define
+$\Delta\!\theta_e=\theta_u-\theta_v$,
+$\Delta\!\varphi_e=\varphi_u-\varphi_v$.
+
+\section{Update rule and surgery}
+For fixed $\varepsilon,\lambda>0$ with
+$0<\varepsilon<1/\deg_{\max}(G_0)$ let
+\begin{equation}
+\kappa_{t+1}(e)=\kappa_t(e)+\varepsilon\bigl(\langle\kappa_t\rangle_{N(e)}-\kappa_t(e)\bigr)-\lambda\,\sgn(\Delta\!\theta_e\,\Delta\!\varphi_e).
+\tag{U}
+\end{equation}
+If $\kappa_{t+1}(e)<\kappa_{\mathrm{cut}}$ the edge is deleted;
+if $\kappa_{t+1}(e)>\kappa_{\mathrm{merge}}$ all missing links between
+the connected components of $e$ are added (surgery).
+
+\section{Lyapunov function}
+Define
+\[
+V_t=\sum_{e\in E_t}\kappa_t(e)^2.
+\]
+\begin{lem}[Spectral averaging]
+\label{lem:spectral}
+With $L_t$ the normalised Laplacian and
+$\lambda_2(t)$ its second eigenvalue,
+\(
+\sum_e\bigl(\kappa_t(e)-\langle\kappa_t\rangle_{N(e)}\bigr)^2
+\ge\lambda_2(t)\,V_t.
+\)
+\end{lem}
+\begin{proof}
+Standard Poincar\'e inequality on graphs; see \cite{Chung1997}.
+\end{proof}
+
+\begin{lem}[Twist cancellation]
+\label{lem:twist}
+$\displaystyle\sum_{e} \kappa_t(e)\,\sgn(\Delta\!\theta_e\Delta\!\varphi_e)=0$.
+\end{lem}
+\begin{proof}
+The sign pattern is antisymmetric on any $2$--cycle; contributions cancel.
+\end{proof}
+
+\section{Single--step decay}
+Let $\Delta\kappa(e)$ denote the RHS of~\eqref{U} minus $\kappa_t(e)$.
+Then
+\[
+\begin{aligned}
+V_{t+1}-V_t &=
+2\!\sum_e\kappa_t(e)\,\Delta\kappa(e)+\sum_e\Delta\kappa(e)^2\\
+&\le -2\varepsilon
+\sum_e\bigl(\kappa_t(e)-\langle\kappa_t\rangle\bigr)^2
++\varepsilon^2\deg_{\max}^2V_t+\lambda^2|E_t|.
+\end{aligned}
+\]
+By Lemma~\ref{lem:spectral} and choosing
+$\lambda\le\varepsilon\sqrt{\lambda_2(t)}$,
+\[
+V_{t+1}\le\bigl(1-\underbrace{(\varepsilon\lambda_2(t)-\lambda^2)}_{=:c_t>0}\bigr)
+V_t .
+\]
+If the graph stays connected, $\lambda_2(t)\ge\underline{\lambda}>0$ and
+$c_t\ge c:=\varepsilon\underline{\lambda}/2$.
+
+\section{Finite--time convergence}
+Hence $V_t\le V_0e^{-ct}$ and for any tolerance $\varepsilon^\*$,
+\[
+t\;\le\;\frac{1}{c}\log\frac{V_0}{\varepsilon^\*}
+\;=\;\frac{2}{\varepsilon\underline{\lambda}}
+\log\frac{V_0}{\varepsilon^\*}.
+\]
+
+\section{Stability of the winding vector}
+When $V_t\to0$ all curvatures vanish.  Equation~\eqref{U} reduces to the
+bounded twist term, so the incremental product
+$\Delta\!\theta_e\Delta\!\varphi_e\to0$ and the total winding
+$(m,n)\in\mathbb Z^2$ becomes constant.
+
+\begin{thm}
+Under the conditions above the discrete Ricci--Torus flow with surgery
+converges in finite time $O(\frac{1}{\varepsilon}\log\frac{V_0}{\varepsilon^\*})$;
+global curvature tends to zero, the winding vector stabilises, and any
+$1$--cycle persisting beyond that time is topologically stable.
+\end{thm}
+
+\bibliographystyle{plain}\begin{thebibliography}{1}
+\bibitem{Chung1997} F.~Chung. \emph{Spectral Graph Theory}. AMS, 1997.
+\end{thebibliography}
+\end{document}
