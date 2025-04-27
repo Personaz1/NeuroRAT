@@ -9,3 +9,4 @@ CLAUDE_CODING_BEST_PRACTICES.md
 **/__pycache__/
 *.pyc
 *.log
+.env
