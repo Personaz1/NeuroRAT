@@ -19,9 +19,10 @@ import tempfile
 import time
 import subprocess
 from typing import Optional, List, Dict, Any, Tuple, Union
+from common.utils import get_logger
 import logging
 
-logger = logging.getLogger('process_hollowing')
+logger = get_logger('process_hollowing')
 
 # Определяем константы для Windows API
 if platform.system().lower() == 'windows':

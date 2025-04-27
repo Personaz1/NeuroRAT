@@ -10,6 +10,7 @@ import random
 import threading
 import queue
 import hashlib
+from common.utils import get_logger
 import logging
 import requests
 import base64
@@ -90,7 +91,7 @@ class StegoTunnel:
         self.send_thread = None
         
         # Настройка логирования
-        self.logger = logging.getLogger("stego_tunnel")
+        self.logger = get_logger("stego_tunnel")
         
         # Статистика
         self.stats = {

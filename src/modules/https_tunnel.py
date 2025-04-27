@@ -11,6 +11,7 @@ import time
 import uuid
 import random
 import base64
+from common.utils import get_logger
 import logging
 import urllib.request
 import urllib.error
@@ -82,7 +83,7 @@ class HTTPSTunnel:
         self.sequence = 0
         
         # Настройка логирования
-        self.logger = logging.getLogger("https_tunnel")
+        self.logger = get_logger("https_tunnel")
         
         # Счетчики и статистика
         self.stats = {

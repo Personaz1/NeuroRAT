@@ -10,6 +10,7 @@ import socket
 import struct
 import random
 import select
+from common.utils import get_logger
 import logging
 import threading
 import binascii
@@ -63,7 +64,7 @@ class ICMPTunnel:
         self.icmp_socket = None
         
         # Настройка логирования
-        self.logger = logging.getLogger("icmp_tunnel")
+        self.logger = get_logger("icmp_tunnel")
         
         # Счетчики и статистика
         self.stats = {

@@ -8,7 +8,6 @@ import os
 import time
 import json
 import random
-import logging
 import threading
 from typing import Dict, List, Any, Optional, Tuple, Union, Callable
 
@@ -18,6 +17,7 @@ from modules.https_tunnel import HTTPSTunnel
 from modules.icmp_tunnel import ICMPTunnel
 from modules.crypto import EncryptionManager, CryptoUtils
 from modules.stego_tunnel import StegoTunnel
+from common.utils import get_logger, resolve_hostname
 
 class ChannelManager:
     """
@@ -54,14 +54,14 @@ class ChannelManager:
             encryption_method: Метод шифрования данных
         """
         self.c2_host = c2_host
-        self.c2_ip = c2_ip or self._resolve_hostname(c2_host)
+        self.c2_ip = c2_ip or resolve_hostname(self.c2_host)
         self.channels_config = channels_config or {}
         self.channel_check_interval = max(30, channel_check_interval)
         self.primary_channel = primary_channel
         self.data_callback = data_callback
         
-        # Инициализация логирования
-        self.logger = logging.getLogger("channel_manager")
+        # Инициализация логирования через общий утилитный логгер
+        self.logger = get_logger("channel_manager")
         
         # Инициализируем каналы связи
         self.channels = {}
@@ -90,23 +90,6 @@ class ChannelManager:
         
         # Инициализируем доступные каналы
         self._initialize_channels()
-    
-    def _resolve_hostname(self, hostname: str) -> str:
-        """
-        Разрешает имя хоста в IP-адрес
-        
-        Args:
-            hostname: Имя хоста для разрешения
-            
-        Returns:
-            str: IP-адрес хоста или None в случае ошибки
-        """
-        import socket
-        try:
-            return socket.gethostbyname(hostname)
-        except socket.gaierror:
-            self.logger.warning(f"Не удалось разрешить имя хоста: {hostname}")
-            return "127.0.0.1"  # Запасной вариант
     
     def _initialize_channels(self) -> None:
         """Инициализирует доступные каналы связи"""

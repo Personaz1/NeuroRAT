@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import random
+from common.utils import get_logger
 import logging
 import platform
 import tempfile
@@ -42,7 +43,7 @@ class Propagator:
         Args:
             log_level: Уровень логирования
         """
-        self.logger = logging.getLogger("propagator")
+        self.logger = get_logger("propagator")
         self.logger.setLevel(getattr(logging, log_level, logging.INFO))
         
         # Инициализируем PolyMorpher для мутации кода

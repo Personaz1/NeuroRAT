@@ -10,6 +10,7 @@ import zlib
 import base64
 import random
 import struct
+from common.utils import get_logger
 import logging
 import hashlib
 from typing import Dict, List, Any, Optional, Tuple, Union, BinaryIO
@@ -51,7 +52,7 @@ class SteganoManager:
         Args:
             log_level: Уровень логирования
         """
-        self.logger = logging.getLogger("steganography")
+        self.logger = get_logger("steganography")
         self.logger.setLevel(getattr(logging, log_level, logging.INFO))
         
         # Проверяем наличие необходимых модулей

@@ -10,6 +10,7 @@ import time
 import random
 import socket
 import struct
+from common.utils import get_logger
 import logging
 import binascii
 import threading
@@ -56,7 +57,7 @@ class DNSTunnel:
         self.sequence = 0
         
         # Настройка логирования
-        self.logger = logging.getLogger("dns_tunnel")
+        self.logger = get_logger("dns_tunnel")
     
     def _generate_session_id(self) -> str:
         """Генерирует уникальный идентификатор сессии"""

@@ -8,7 +8,6 @@ import os
 import re
 import random
 import string
-import logging
 import hashlib
 import base64
 import importlib.util
@@ -18,6 +17,7 @@ import marshal
 import zlib
 import time
 from typing import Dict, List, Any, Optional, Callable, Tuple, Union
+from common.utils import get_logger
 
 class PolyMorpher:
     """
@@ -32,7 +32,7 @@ class PolyMorpher:
         Args:
             log_level: Уровень логирования
         """
-        self.logger = logging.getLogger("polymorpher")
+        self.logger = get_logger("polymorpher")
         self.logger.setLevel(getattr(logging, log_level, logging.INFO))
         
         # Счетчик для уникальных имен

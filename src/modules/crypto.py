@@ -9,6 +9,7 @@ import base64
 import hashlib
 import hmac
 import time
+from common.utils import get_logger
 import logging
 from typing import Dict, List, Any, Optional, Tuple, Union, Callable
 
@@ -35,7 +36,7 @@ class CryptoProvider:
             key: Ключ шифрования (если None, генерируется автоматически)
         """
         self.key = key if key is not None else self._generate_key()
-        self.logger = logging.getLogger("crypto")
+        self.logger = get_logger("crypto")
         
     def _generate_key(self) -> bytes:
         """Генерирует новый ключ шифрования"""
@@ -380,7 +381,7 @@ class EncryptionManager:
         """
         self.providers = {}
         self.default_method = default_method
-        self.logger = logging.getLogger("encryption_manager")
+        self.logger = get_logger("encryption_manager")
         
         # Инициализируем доступные провайдеры
         try:
