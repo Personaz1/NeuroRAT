@@ -28,6 +28,8 @@ from vulnerability_scanner import VulnerabilityScanner
 from exploit_engine import ExploitEngine
 from exploit_manager import ExploitManager
 from steganography import SteganoManager
+from src.modules.icmp_tunnel import ICMTunnel
+# from worm import WormholePropagator # Закомментировано - неизвестный модуль
 
 # Настройка логирования
 logging.basicConfig(

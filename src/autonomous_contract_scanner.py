@@ -15,8 +15,8 @@ from typing import Dict, List, Any, Optional, Tuple, Union, Set
 from datetime import datetime
 
 # Импортируем необходимые модули
-from modules.web3_contract_analyzer import Web3ContractAnalyzer
-from modules.web3_drainer import Web3Drainer, MEVDrainer
+from src.modules.web3_contract_analyzer import Web3ContractAnalyzer
+from src.modules.web3_drainer import Web3Drainer, MEVDrainer
 
 # Настройка логирования
 logging.basicConfig(

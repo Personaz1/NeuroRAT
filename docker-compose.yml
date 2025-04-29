@@ -1,38 +1,112 @@
 version: '3.8'
 
 services:
-  agentx:
+#  agentx:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
+#    container_name: agentx
+#    restart: unless-stopped
+#    ports:
+#      - "80:80"     # Frontend
+#      - "8000:8000" # API
+#    volumes:
+#      - ./data:/app/data
+#    environment:
+#      - ENV=production
+#      - LOG_LEVEL=INFO
+#    networks:
+#      - agentx-network
+
+  redis:
+    image: "redis:alpine"
+    ports:
+      # Открываем порт Redis наружу (на localhost) для удобства отладки, необязательно
+      - "6379:6379"
+    volumes:
+      # Опционально: сохраняем данные Redis между перезапусками
+      - redis_data:/data
+    networks:
+      - agentx_network
+
+  dns-server:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: agentx
-    restart: unless-stopped
+      dockerfile: Dockerfile.dns
     ports:
-      - "80:80"     # Frontend
-      - "8000:8000" # API
-    volumes:
-      - ./data:/app/data
+      # Пробрасываем UDP порт 5333 из контейнера наружу
+      - "5333:5333/udp"
     environment:
-      - ENV=production
-      - LOG_LEVEL=INFO
+      # Указываем, какой домен считать "своим"
+      C2_DOMAIN: "test.neurorat.local"
+      # Указываем адрес Redis внутри Docker-сети (используем имя сервиса 'redis')
+      REDIS_URL: "redis://redis:6379/1" # Используем БД 1 для DNS/C2
+      # Указываем порт, который должен слушать DNS сервер ВНУТРИ контейнера
+      DNS_LISTEN_PORT: "5333"
+      LOG_LEVEL: "DEBUG" # Включаем DEBUG логи для DNS сервера
+    depends_on:
+      - redis
     networks:
-      - agentx-network
+      - agentx_network
+    # Для UDP на macOS может понадобиться healthcheck или restart policy
+    restart: unless-stopped
 
-  # Вы можете добавить MongoDB или другую базу данных по необходимости
-  # mongodb:
-  #   image: mongo:latest
-  #   container_name: agentx-mongo
-  #   restart: unless-stopped
-  #   volumes:
-  #     - ./data/mongodb:/data/db
-  #   ports:
-  #     - "27017:27017"
-  #   networks:
-  #     - agentx-network
+  c2-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.c2
+    ports:
+      # Пробрасываем HTTP порт 8000 наружу
+      - "8000:8000"
+    environment:
+      # Указываем адрес Redis внутри Docker-сети
+      REDIS_URL: "redis://redis:6379/1" # Используем ту же БД 1
+      LOG_LEVEL: "DEBUG" # Включаем DEBUG логи для C2 сервера
+    volumes:
+      # Монтируем код внутрь контейнера, чтобы --reload работал при изменениях на хосте
+      - ./src:/app/src
+    depends_on:
+      - redis
+    networks:
+      - agentx_network
+    restart: unless-stopped
+
+  # НОВЫЙ СЕРВИС: Агент (DNS Tunnel Client)
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    environment:
+      # Передаем настройки через переменные окружения
+      # Имя хоста dns-server будет разрешено внутри Docker сети
+      AGENT_C2_DOMAIN: "test.neurorat.local"
+      AGENT_DNS_SERVER_IP: "dns-server"
+      AGENT_DNS_SERVER_PORT: "5333"
+      LOG_LEVEL: "DEBUG" # Включаем DEBUG логи для агента
+    depends_on:
+      - dns-server # Запускать после DNS-сервера
+      - c2-server # Желательно, хотя прямой зависимости нет
+    networks:
+      - agentx_network
+    # Агент - это клиент, перезапускать его автоматически не всегда нужно
+    # restart: unless-stopped
+
+# Вы можете добавить MongoDB или другую базу данных по необходимости
+# mongodb:
+#   image: mongo:latest
+#   container_name: agentx-mongo
+#   restart: unless-stopped
+#   volumes:
+#     - ./data/mongodb:/data/db
+#   ports:
+#     - "27017:27017"
+#   networks:
+#     - agentx-network
 
 networks:
-  agentx-network:
+  agentx_network:
     driver: bridge
 
 volumes:
-  data: 
+  # data: # Больше не используется после удаления agentx
+  redis_data: 

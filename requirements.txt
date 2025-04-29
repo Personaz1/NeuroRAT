@@ -2,4 +2,13 @@ web3==6.11.1
 requests==2.31.0
 eth-account>=0.8.0
 pycryptodome>=3.18.0
-python-dotenv>=1.0.0 
+python-dotenv>=1.0.0
+dnspython>=2.4.2
+redis>=4.3.0
+fastapi>=0.100.0
+pydantic>=2.0.0
+py-solc-x==1.9.0
+dnslib
+pymongo
+Flask
+psutil 

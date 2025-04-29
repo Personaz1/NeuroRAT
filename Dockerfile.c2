@@ -1,0 +1,25 @@
+# Используем базовый образ Python
+FROM python:3.11-slim
+
+# Устанавливаем рабочую директорию
+WORKDIR /app
+
+# Копируем файл с зависимостями
+# Предполагаем, что requirements.txt находится в корне проекта и содержит все нужное
+COPY requirements.txt ./
+
+# Устанавливаем зависимости
+# Добавляем uvicorn для запуска FastAPI и redis-py
+RUN pip install --no-cache-dir -r requirements.txt uvicorn redis
+
+# Копируем всю директорию src с исходным кодом
+COPY src/ ./src/
+
+# Открываем HTTP порт, который будет слушать C2 сервер (FastAPI/uvicorn)
+EXPOSE 8000
+
+# Команда по умолчанию для запуска C2 сервера
+# Переменные окружения (REDIS_URL) будут заданы в docker-compose.yml
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Используем --reload для удобства разработки, чтобы сервер перезапускался при изменениях кода
+# В продакшене --reload нужно убрать 

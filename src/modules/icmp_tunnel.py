@@ -10,7 +10,7 @@ import socket
 import struct
 import random
 import select
-from common.utils import get_logger
+from ..common.utils import get_logger
 import logging
 import threading
 import binascii

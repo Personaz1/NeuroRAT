@@ -11,7 +11,7 @@ import time
 import uuid
 import random
 import base64
-from common.utils import get_logger
+from ..common.utils import get_logger
 import logging
 import urllib.request
 import urllib.error

@@ -8,7 +8,7 @@ import os
 import sys
 import time
 import random
-from common.utils import get_logger
+from ..common.utils import get_logger
 import logging
 import platform
 import tempfile

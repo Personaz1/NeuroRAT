@@ -5,5 +5,5 @@ class WebScanner:
         pass
 
     def scan(self, url):
-        """Заглушка: не реализовано"""
+        # """Заглушка: не реализовано"""
         raise NotImplementedError("WebScanner не реализован") 

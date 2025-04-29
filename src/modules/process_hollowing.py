@@ -19,7 +19,7 @@ import tempfile
 import time
 import subprocess
 from typing import Optional, List, Dict, Any, Tuple, Union
-from common.utils import get_logger
+from ..common.utils import get_logger
 import logging
 
 logger = get_logger('process_hollowing')

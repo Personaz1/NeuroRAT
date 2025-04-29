@@ -10,7 +10,7 @@ import random
 import threading
 import queue
 import hashlib
-from common.utils import get_logger
+from ..common.utils import get_logger
 import logging
 import requests
 import base64

