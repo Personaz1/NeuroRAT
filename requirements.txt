@@ -15,4 +15,9 @@ psutil
 PyYAML
 pytest-asyncio
 colorlog
-pyfiglet 
+pyfiglet
+uvicorn[standard]
+setproctitle
+numpy
+Pillow
+celery[redis] 

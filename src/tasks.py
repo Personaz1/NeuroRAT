@@ -21,7 +21,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv()
 
 from src.celery_app import celery_app, REDIS_URL
-from src.modules.web3_contract_analyzer import SmartContractAnalyzer
+from src.modules.web3_contract_analyzer import Web3ContractAnalyzer
 # Import exploit/drainer modules later when needed for exploit_task
 # from src.modules.web3_drainer import Web3Drainer
 
@@ -48,7 +48,7 @@ EXPLOITED_CONTRACTS_SET = "neurozond:exploited_contracts" # Новый сет д
 # Initialize Analyzer (could be done per task call if state needs isolation)
 # Be mindful of resource usage if creating many analyzer instances
 # Consider passing configuration path if needed
-contract_analyzer = SmartContractAnalyzer() 
+contract_analyzer = Web3ContractAnalyzer() 
 
 # --- Configuration ---
 ATTACKER_PRIVATE_KEY = os.getenv("ATTACKER_PRIVATE_KEY")

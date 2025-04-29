@@ -108,14 +108,20 @@ class Web3ContractAnalyzer:
         try:
             self.w3 = connect_to_node(self.config.get('ethereum_rpc_url'))
             logger.info(f"Connected to Ethereum node: {self.config.get('ethereum_rpc_url')}")
-            
-            # Install specific solc version if needed
-            solc_version = self.config.get('solc_version', '0.8.17')
-            if not solcx.get_installed_solc_versions() or solc_version not in solcx.get_installed_solc_versions():
-                logger.info(f"Installing solc version {solc_version}")
-                solcx.install_solc(solc_version)
-            solcx.set_solc_version(solc_version)
-            
+
+            # Проверяем, что solc доступен системно
+            try:
+                solc_path = solcx.get_solcx_install_folder()
+                installed_versions = solcx.get_installed_solc_versions()
+                logger.info(f"Found solc versions in {solc_path}: {installed_versions}")
+                # Устанавливаем активную версию, если py-solc-x не нашел системную сам
+                # Возможно, это не потребуется, если solc в PATH
+                # solc_version_obj = solcx.get_compilers()[-1] # Берем последнюю найденную
+                # solcx.set_solc_version(solc_version_obj, silent=True)
+                # logger.info(f"Set active solc version via py-solc-x: {solcx.get_solc_version()}")
+            except Exception as e:
+                 logger.warning(f"Could not automatically detect/set system solc version via py-solc-x: {e}. Assuming solc is in PATH.")
+
         except Exception as e:
             logger.error(f"Failed to initialize Smart Contract Analyzer: {str(e)}")
             raise
