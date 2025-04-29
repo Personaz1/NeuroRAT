@@ -183,7 +183,7 @@ class PolyMorpher:
                 f"{random.randint(1000, 9999999)}",
                 f"{random.random() * 1000:.6f}",
                 f"[{', '.join(str(random.randint(1, 100)) for _ in range(random.randint(1, 5)))}]",
-                f"{{{', '.join(f'\"{self._generate_random_id(4)}\": {random.randint(1, 100)}' for _ in range(random.randint(1, 3)))}}}"
+                f"""{{{', '.join(f'"{self._generate_random_id(4)}": {random.randint(1, 100)}' for _ in range(random.randint(1, 3)))}}}"""
             ])
             
             # Добавляем некоторую логику с переменной для затруднения оптимизации мертвого кода
@@ -194,8 +194,7 @@ class PolyMorpher:
             if random.random() < 0.3:
                 condition = random.choice([
                     f"int(time.time()) % {random.randint(100, 999)} == {random.randint(0, 99)}",
-                    f"len('{self._generate_random_id(random.randint(10, 30))
-                    }') > {random.randint(20, 40)}",
+                    f"len('{self._generate_random_id(random.randint(10, 30))}') > {random.randint(20, 40)}",
                     f"random.random() < {random.random():.5f}"
                 ])
                 operations.append(f"if {condition}: {junk_var} = {junk_value}")

@@ -23,7 +23,8 @@ import dns.query
 import dns.rdatatype
 import dns.rdataclass
 
-from common.utils import get_logger
+# Используем относительный импорт, т.к. запускаем как модуль
+from ..common.utils import get_logger
 
 # DNS-заголовки и константы - теперь используются из dnspython
 # DNS_QUERY_TYPE_A = 1
@@ -63,6 +64,9 @@ class DNSTunnel:
         self.jitter = jitter
         self.max_chunk_size = max_chunk_size
         self.callback = callback
+        # Сохраняем переданные IP и порт DNS-сервера
+        self.dns_server_ip = dns_server_ip
+        self.dns_server_port = dns_server_port
         
         self.is_running = False
         self.receive_thread = None
@@ -127,8 +131,8 @@ class DNSTunnel:
         Returns:
             bool: Успешность операции
         """
-        # Кодируем данные в base32 (DNS-friendly)
-        encoded_data = base64.b32encode(data).decode().rstrip('=').lower()
+        # Кодируем данные в base32 (DNS-friendly), оставляем паддинг и верхний регистр
+        encoded_data = base64.b32encode(data).decode('ascii') # Используем ascii декодирование
         
         # Разбиваем на чанки
         chunks = [encoded_data[i:i+self.max_chunk_size] for i in range(0, len(encoded_data), self.max_chunk_size)]

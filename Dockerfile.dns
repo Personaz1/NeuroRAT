@@ -8,13 +8,13 @@ WORKDIR /app
 # (dnslib для обработки DNS, redis для связи с C2)
 RUN pip install dnslib redis
 
-# Копируем скрипт DNS-сервера в контейнер
-COPY src/dns_server.py ./src/dns_server.py
+# Копируем всю директорию src, содержащую скрипт сервера и возможные общие модули
+COPY src/ ./src/
 
-# Открываем UDP порт, который будет слушать сервер (можно переопределить в docker-compose)
-EXPOSE 5353/udp
+# Открываем UDP порт, который будет слушать сервер (совпадает с портом в docker-compose)
+EXPOSE 5333/udp
 
-# Команда по умолчанию для запуска сервера
+# Команда по умолчанию для запуска сервера как модуля
 # Переменные окружения (C2_DOMAIN, REDIS_URL, DNS_LISTEN_PORT)
 # будут заданы в docker-compose.yml
-CMD ["python", "src/dns_server.py"] 
+CMD ["python", "-u", "-m", "src.dns_server"] 

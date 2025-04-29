@@ -50,6 +50,9 @@ services:
       - agentx_network
     # Для UDP на macOS может понадобиться healthcheck или restart policy
     restart: unless-stopped
+    # Возвращаем стандартный запуск
+    # command: >
+    #  sh -c "apt-get update && apt-get install -y net-tools && python -u -m src.dns_server"
 
   c2-server:
     build:
@@ -62,9 +65,7 @@ services:
       # Указываем адрес Redis внутри Docker-сети
       REDIS_URL: "redis://redis:6379/1" # Используем ту же БД 1
       LOG_LEVEL: "DEBUG" # Включаем DEBUG логи для C2 сервера
-    volumes:
-      # Монтируем код внутрь контейнера, чтобы --reload работал при изменениях на хосте
-      - ./src:/app/src
+    # volumes: # Временно убираем volume, чтобы исключить проблемы с ним
     depends_on:
       - redis
     networks:
@@ -80,9 +81,12 @@ services:
       # Передаем настройки через переменные окружения
       # Имя хоста dns-server будет разрешено внутри Docker сети
       AGENT_C2_DOMAIN: "test.neurorat.local"
-      AGENT_DNS_SERVER_IP: "dns-server"
+      # Используем IP адрес dns-server вместо имени
+      AGENT_DNS_SERVER_IP: "172.19.0.3"
       AGENT_DNS_SERVER_PORT: "5333"
       LOG_LEVEL: "DEBUG" # Включаем DEBUG логи для агента
+      # Явно указываем PYTHONPATH, чтобы включить /app для поиска модулей
+      PYTHONPATH: "/app"
     depends_on:
       - dns-server # Запускать после DNS-сервера
       - c2-server # Желательно, хотя прямой зависимости нет
@@ -90,6 +94,10 @@ services:
       - agentx_network
     # Агент - это клиент, перезапускать его автоматически не всегда нужно
     # restart: unless-stopped
+    # Возвращаем оригинальную команду запуска из Dockerfile
+    # command: ["sleep", "infinity"]
+    # command: >
+    #  sh -c "apt-get update && apt-get install -y dnsutils && sleep infinity"
 
 # Вы можете добавить MongoDB или другую базу данных по необходимости
 # mongodb:

@@ -26,13 +26,19 @@ import tempfile
 import time # Added for LLM rate limiting simulation
 
 # Local imports
-from core.config import Config
-from core.logging_utils import setup_logger
-from utils.blockchain_utils import connect_to_node, get_contract_bytecode
-from utils.reporting import generate_report
+from src.core.config import Config
+from src.utils.blockchain_utils import connect_to_node, get_contract_bytecode
+from src.utils.reporting import generate_report
 
-# Setup logging
-logger = setup_logger(__name__)
+# Setup logging using standard logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO) # Set a default level
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+# Avoid adding handler multiple times if module reloads somehow
+if not logger.hasHandlers():
+    logger.addHandler(handler)
 
 # Placeholder for LLM interaction
 def call_llm_for_analysis(prompt: str, model_name: str = "default") -> Dict[str, Any]:
@@ -65,7 +71,7 @@ def call_llm_for_analysis(prompt: str, model_name: str = "default") -> Dict[str,
 
     return assessment
 
-class SmartContractAnalyzer:
+class Web3ContractAnalyzer:
     """
     Analyzes Ethereum smart contracts for vulnerabilities and exploitable patterns.
     """
@@ -584,7 +590,7 @@ def main():
         parser.print_help()
         sys.exit(1)
     
-    analyzer = SmartContractAnalyzer(args.config)
+    analyzer = Web3ContractAnalyzer(args.config)
     
     source_code = None
     if args.file:
