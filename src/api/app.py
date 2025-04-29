@@ -1,8 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from common.utils import get_logger
-from channel_manager import ChannelManager
-from api.exploit import router as exploit_router
+from src.common.utils import get_logger
+from src.channel_manager import ChannelManager
+from src.api.exploit import router as exploit_router
 import uvicorn
 import uuid  # Добавляем импорт uuid
 import time  # Добавляем импорт time

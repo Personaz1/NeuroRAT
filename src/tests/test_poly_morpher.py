@@ -14,7 +14,7 @@ import pytest
 # Добавляем директорию src в путь для импорта модулей
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.poly_morpher import PolyMorpher
+from src.modules.poly_morpher import PolyMorpher
 
 pytest.skip("Skipping poly morph tests", allow_module_level=True)
 

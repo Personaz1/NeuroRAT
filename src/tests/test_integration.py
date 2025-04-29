@@ -19,8 +19,8 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Импортируем тестируемые модули
-from exploit_automation import ExploitAutomation
-from c1_exploit_integration import C1ExploitIntegration
+from src.exploit_automation import ExploitAutomation
+from src.c1_exploit_integration import C1ExploitIntegration
 
 class TestExploitAutomation(unittest.TestCase):
     """Тесты для модуля автоматизации эксплойтов."""

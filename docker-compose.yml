@@ -87,6 +87,8 @@ services:
       LOG_LEVEL: "DEBUG" # Включаем DEBUG логи для агента
       # Явно указываем PYTHONPATH, чтобы включить /app для поиска модулей
       PYTHONPATH: "/app"
+      # Добавляем URL основного C2 сервера
+      C2_URL: "http://c2-server:8000"
     depends_on:
       - dns-server # Запускать после DNS-сервера
       - c2-server # Желательно, хотя прямой зависимости нет

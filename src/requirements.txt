@@ -1,14 +1,16 @@
-cryptography>=3.4.0
-requests>=2.25.0
+pydantic>=1.8
+prometheus-client>=0.14.1
+# web3 # Use specific older version for compatibility
+web3==6.0.0b9
+python-dotenv
+solc-select
 argparse>=1.4.0
 fastapi>=0.75.0
 uvicorn>=0.17.0
-pydantic>=1.8
-prometheus-client>=0.14.1
-web3
-python-dotenv
-solc-select
-slither-analyzer
+python-nmap
+# eth-typing==4.1.0
+eth-typing==4.0.0b1
 celery[redis]
 redis
-python-nmap 
+slither-analyzer
+parsimonious>=0.10.0 # Fix inspect.getargspec error in Python 3.11 

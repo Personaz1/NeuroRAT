@@ -5,7 +5,7 @@ import time
 import random
 import json
 import base64
-from common.utils import get_logger, jitter_sleep
+from src.common.utils import get_logger, jitter_sleep
 import threading
 import queue
 import urllib.request

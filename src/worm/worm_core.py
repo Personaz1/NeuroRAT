@@ -7,9 +7,9 @@ import socket
 from datetime import datetime
 
 # Импортируем свои модули
-from worm.propagation import propagate, propagate_targeted
-from stealth.stealth import enable_stealth, is_vm
-from comms.comms import establish_c2, send_c2_data, receive_c2_commands
+from src.worm.propagation import propagate, propagate_targeted
+from src.stealth.stealth import enable_stealth, is_vm
+from src.comms.comms import establish_c2, send_c2_data, receive_c2_commands
 
 # Настройка логирования
 logging.basicConfig(

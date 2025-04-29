@@ -25,7 +25,7 @@ except ImportError:
 
 # Импортируем утилиты для логирования
 try:
-    from common.utils import get_logger
+    from src.common.utils import get_logger
 except ImportError:
     def get_logger(name):
         logger = logging.getLogger(name)

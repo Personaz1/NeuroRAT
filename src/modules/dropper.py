@@ -19,13 +19,7 @@ import subprocess
 import ctypes
 import shutil
 from typing import Optional, List, Dict, Any, Tuple
-
-# Импортируем модуль для полиморфной трансформации, если доступен
-try:
-    from polymorpher import PolyMorpher
-    POLYMORPHER_AVAILABLE = True
-except ImportError:
-    POLYMORPHER_AVAILABLE = False
+from src.polymorpher import PolyMorpher
 
 class Dropper:
     """Класс для доставки и загрузки зондов на целевые системы."""

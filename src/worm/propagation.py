@@ -9,10 +9,10 @@ import queue
 from typing import List, Dict, Any, Optional, Union, Set
 
 # Импортируем модули для эксплуатации
-from exploit_engine import ExploitEngine
-from vulnerability_scanner import VulnerabilityScanner
+from src.exploit_engine import ExploitEngine
+from src.vulnerability_scanner import VulnerabilityScanner
 from src.exploit_manager import ExploitManager
-from comms.comms import send_c2_data
+from src.comms.comms import send_c2_data
 from queue import Queue, Empty
 
 # Настройка логирования

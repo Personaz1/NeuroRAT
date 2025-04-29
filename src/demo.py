@@ -22,8 +22,8 @@ logging.basicConfig(
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Импортируем наши модули
-from modules.poly_morpher import PolyMorpher
-from modules.steganography import SteganoManager
+from src.modules.poly_morpher import PolyMorpher
+from src.modules.steganography import SteganoManager
 
 def demo_polymorphism():
     """Демонстрация возможностей полиморфной трансформации кода"""

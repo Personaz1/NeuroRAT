@@ -1,18 +1,124 @@
-# Используем базовый образ Python
-FROM python:3.11-slim
+# Этап 1: Сборка Windows DLL с использованием MinGW
+FROM debian:bookworm-slim as builder
 
-# Устанавливаем рабочую директорию
+# Устанавливаем зависимости для кросс-компиляции C++ под Windows
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    make \
+    mingw-w64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копируем исходный код и toolchain файл
+WORKDIR /build
+COPY src/native/cpp_injector/ ./cpp_injector/
+
+# Создаем директорию для сборки и собираем с указанием toolchain файла
+# Указываем абсолютный путь к toolchain файлу
+RUN cmake -S ./cpp_injector -B ./build_dir \
+    -DCMAKE_TOOLCHAIN_FILE=/build/cpp_injector/mingw-w64-toolchain.cmake \
+    -DCMAKE_BUILD_TYPE=Release
+RUN cmake --build ./build_dir --config Release
+
+# Отладочный вывод: показать всю структуру build_dir
+RUN echo "--- Contents of /build/build_dir after build: ---" && ls -R /build/build_dir || echo "Directory /build/build_dir not found"
+
+# Этап 2: Сборка основного Python-агента (на Linux)
+FROM python:3.11-slim-bookworm
+
 WORKDIR /app
 
-# Устанавливаем зависимости (только dnspython нужен для этого модуля)
-# Добавь другие зависимости сюда, если агент будет их использовать
-RUN pip install dnspython
+COPY requirements.txt .
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+RUN python -m pip install --no-cache-dir -r requirements.txt
 
-# Копируем всю директорию src, содержащую код агента и общие утилиты
 COPY src/ ./src/
 
-# Команда по умолчанию для запуска агента как модуля
-# Переменные окружения для конфигурации (AGENT_C2_DOMAIN и т.д.)
-# будут установлены в docker-compose.yml или оставлены по умолчанию
-CMD ["python", "-u", "-m", "src.modules.dns_tunnel"]
-# Флаг -u нужен для небуферизованного вывода, чтобы логи сразу появлялись в Docker 
+# Копируем скомпилированную Windows DLL из этапа сборки 
+# CMake добавляет префикс 'lib' для MODULE, даже для DLL
+COPY --from=builder /build/build_dir/libcpp_injector.dll /app/src/native/cpp_injector/build/lib/cpp_injector.dll
+
+ENTRYPOINT ["python", "-u", "-m", "src.autonomous_agent"] 
+# CMD можно использовать для передачи пути к конфигу по умолчанию, если нужно
+# CMD ["config/agent_config.json"] 
+
+# Stage 1: Build C++ native components (injector, stager, test payload)
+FROM ubuntu:22.04 as native-builder
+
+WORKDIR /build
+
+# Install build essentials, CMake, MinGW toolchain
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    mingw-w64 \
+    git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy native source code and CMake toolchain file
+COPY src/native/ /build/src/native/
+COPY agent_implant/stager/ /build/agent_implant/stager/
+COPY test_payloads/reflective_dll_test/ /build/test_payloads/reflective_dll_test/
+# Correct path for the toolchain file
+COPY src/native/cpp_injector/mingw-w64-toolchain.cmake /build/build/cmake/
+
+# Configure and build using CMake with MinGW toolchain
+# Ensure the build directory for CMake exists before running cmake command
+RUN mkdir -p /build/native_build && \
+    cmake \
+    -S /build/src/native/ \
+    -B /build/native_build \
+    -DCMAKE_TOOLCHAIN_FILE=/build/build/cmake/mingw-w64-toolchain.cmake && \
+    cmake --build /build/native_build --config Release --parallel $(nproc)
+
+# Stage 2: Build Python components and create final image
+FROM python:3.10-slim as python-builder
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+RUN python -m pip install --no-cache-dir -r requirements.txt
+
+COPY . /app
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy compiled native components from the native-builder stage
+COPY --from=native-builder /build/native_build/cpp_injector/lib/cpp_injector.dll /app/src/native/cpp_injector/build/lib/
+COPY --from=native-builder /build/native_build/stager/stager.exe /app/bin/ # Place stager exe in a bin directory
+COPY --from=native-builder /build/native_build/reflective_dll_test/payload.bin /app/payloads/ # Place test payload
+
+# Final Stage
+FROM python:3.10-slim as final
+
+WORKDIR /app
+
+# Install runtime OS dependencies (if any needed, e.g., for native code)
+# RUN apt-get update && apt-get install -y --no-install-recommends <packages> && rm -rf /var/lib/apt/lists/*
+
+# Copy Python requirements first
+COPY --from=python-builder /app/requirements.txt .
+
+# Install Python dependencies in the final stage
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code (excluding potentially large build artifacts copied earlier)
+COPY --from=python-builder /app /app
+
+# Explicitly copy compiled native components needed at runtime
+# Assuming injector DLL is needed by Python agent
+COPY --from=native-builder /build/native_build/cpp_injector/lib/cpp_injector.dll /app/src/native/cpp_injector/build/lib/
+# Copy stager and payload for potential use/delivery (adjust paths if needed)
+COPY --from=native-builder /build/native_build/stager/stager.exe /app/bin/
+COPY --from=native-builder /build/native_build/reflective_dll_test/payload.bin /app/payloads/
+
+# Ensure native libraries can be found (if DLLs are loaded directly by Python/OS)
+# ENV LD_LIBRARY_PATH=/app/src/native/cpp_injector/build/lib:${LD_LIBRARY_PATH} # Likely not needed if loaded via ctypes with full path
+
+# Set the entry point
+ENTRYPOINT ["python", "src/autonomous_agent.py"]
+
+# Default command
+CMD [] 

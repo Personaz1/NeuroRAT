@@ -17,18 +17,7 @@ import subprocess
 from typing import Dict, List, Any, Optional, Tuple, Union, Set
 
 # Импортируем утилиты для логирования
-try:
-    from common.utils import get_logger
-except ImportError:
-    def get_logger(name):
-        logger = logging.getLogger(name)
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-        return logger
+from src.common.utils import get_logger
 
 class CryptoDrainer:
     """

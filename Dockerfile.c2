@@ -20,8 +20,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Создаем директорию для gpg и устанавливаем права (оставляем на всякий случай, если понадобится для других ключей)
     mkdir -p /root/.gnupg && \
     chmod 700 /root/.gnupg && \
-    # Устанавливаем зависимости Python (py-solc-x установит solc при необходимости)
+    # Update pip and setuptools first
+    pip install --upgrade pip setuptools && \
+    # Install python dependencies from file
+    # Install eth-typing first with specific version
+    # pip install --no-cache-dir eth-typing==4.1.0
+    # Install other python dependencies from file
     pip install --no-cache-dir -r /app/requirements.txt && \
+    # Install web3 separately
+    # pip install --no-cache-dir web3==5.31.4 && \
     # Очищаем кэш apt
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*

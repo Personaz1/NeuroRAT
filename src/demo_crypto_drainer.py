@@ -21,14 +21,14 @@ logger = logging.getLogger("demo_crypto_drainer")
 
 # Импортируем модули дрейнеров
 try:
-    from modules.crypto_drainer import CryptoDrainer, WebDrainer
+    from src.modules.crypto_drainer import CryptoDrainer, WebDrainer
     HAS_CRYPTO_DRAINER = True
 except ImportError:
     logger.warning("Модуль crypto_drainer не найден")
     HAS_CRYPTO_DRAINER = False
 
 try:
-    from modules.web3_drainer import Web3Drainer, MEVDrainer
+    from src.modules.web3_drainer import Web3Drainer, MEVDrainer
     HAS_WEB3_DRAINER = True
 except ImportError:
     logger.warning("Модуль web3_drainer не найден")

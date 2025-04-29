@@ -12,12 +12,12 @@ import threading
 from typing import Dict, List, Any, Optional, Tuple, Union, Callable
 
 # Импортируем модули каналов связи
-from modules.dns_tunnel import DNSTunnel
-from modules.https_tunnel import HTTPSTunnel
-from modules.icmp_tunnel import ICMPTunnel
-from modules.crypto import EncryptionManager, CryptoUtils
-from modules.stego_tunnel import StegoTunnel
-from common.utils import get_logger, resolve_hostname
+from src.modules.dns_tunnel import DNSTunnel
+from src.modules.https_tunnel import HTTPSTunnel
+from src.modules.icmp_tunnel import ICMPTunnel
+from src.modules.crypto import EncryptionManager, CryptoUtils
+from src.modules.stego_tunnel import StegoTunnel
+from src.common.utils import get_logger, resolve_hostname
 
 class ChannelManager:
     """
