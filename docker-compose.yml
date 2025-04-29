@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  agentx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agentx
+    restart: unless-stopped
+    ports:
+      - "80:80"     # Frontend
+      - "8000:8000" # API
+    volumes:
+      - ./data:/app/data
+    environment:
+      - ENV=production
+      - LOG_LEVEL=INFO
+    networks:
+      - agentx-network
+
+  # Вы можете добавить MongoDB или другую базу данных по необходимости
+  # mongodb:
+  #   image: mongo:latest
+  #   container_name: agentx-mongo
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./data/mongodb:/data/db
+  #   ports:
+  #     - "27017:27017"
+  #   networks:
+  #     - agentx-network
+
+networks:
+  agentx-network:
+    driver: bridge
+
+volumes:
+  data: 

@@ -4,4 +4,10 @@ argparse>=1.4.0
 fastapi>=0.75.0
 uvicorn[standard]>=0.17.0
 pydantic>=1.8
-prometheus-client>=0.14.1 
+prometheus-client>=0.14.1
+web3
+python-dotenv
+solc-select
+slither-analyzer
+celery[redis]
+redis 
