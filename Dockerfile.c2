@@ -7,7 +7,7 @@ WORKDIR /app/src
 # Устанавливаем переменную окружения PYTHONPATH (на всякий случай)
 ENV PYTHONPATH="/app/src:/app"
 # Добавляем стандартный путь для pip-установленных скриптов в PATH
-ENV PATH="/usr/local/bin:${PATH}"
+ENV PATH="/usr/local/bin:/root/.local/bin:${PATH}"
 
 # Копируем файл зависимостей ПЕРЕД установкой
 COPY requirements.txt /app/requirements.txt
@@ -23,12 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Update pip and setuptools first
     pip install --upgrade pip setuptools && \
     # Install python dependencies from file
-    # Install eth-typing first with specific version
-    # pip install --no-cache-dir eth-typing==4.1.0
-    # Install other python dependencies from file
     pip install --no-cache-dir -r /app/requirements.txt && \
-    # Install web3 separately
-    # pip install --no-cache-dir web3==5.31.4 && \
+    # Install solc-select and use it to install solc
+    pip install solc-select && \
+    solc-select install 0.8.19 && \
+    solc-select use 0.8.19 && \
     # Очищаем кэш apt
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*

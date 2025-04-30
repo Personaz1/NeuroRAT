@@ -44,10 +44,48 @@
 //===============================================================================================//
 #define DLL_QUERY_HMODULE   6
 //===============================================================================================//
+#ifdef _MSC_VER
 #pragma intrinsic( _ReturnAddress )
+#endif
 // This function can not be inlined as it need to arguments and we need to retrieve the RetAddress
 __declspec(noinline)
 ULONG_PTR caller( VOID );
+//===============================================================================================//
+// --- Хак для MinGW: если winternl.h не содержит BaseDllName, определяем только BaseDllName ---
+#ifndef FIELD_OFFSET
+#define FIELD_OFFSET(type, field)    ((LONG)(LONG_PTR)&(((type *)0)->field))
+#endif
+
+#ifndef LDR_DATA_TABLE_ENTRY_HAS_BASEDLLNAME
+// Если winternl.h не содержит BaseDllName, определяем offset вручную (только для MinGW)
+#define LDR_DATA_TABLE_ENTRY_HAS_BASEDLLNAME 0
+#else
+#define LDR_DATA_TABLE_ENTRY_HAS_BASEDLLNAME 1
+#endif
+//===============================================================================================//
+// Минимальные определения структур для обхода winternl.h
+#if defined(_WIN64)
+#define OFFSET_LDR_DATA_TABLE_ENTRY_BASEDLLNAME 0x58
+#else
+#define OFFSET_LDR_DATA_TABLE_ENTRY_BASEDLLNAME 0x2C
+#endif
+
+// Минимальная структура PEB (только нужные поля)
+typedef struct _PEB_LDR_DATA_MIN {
+    BYTE       Reserved1[16];
+    LIST_ENTRY InMemoryOrderModuleList;
+} PEB_LDR_DATA_MIN, *PPEB_LDR_DATA_MIN;
+
+typedef struct _PEB_MIN {
+    BYTE          Reserved1[2];
+    BYTE          BeingDebugged;
+    BYTE          Reserved2[1];
+    PVOID         Reserved3[2];
+    PPEB_LDR_DATA_MIN Ldr;
+} PEB_MIN, *PPEB_MIN;
+
+// Макрос для получения BaseDllName через offset
+#define GET_BASEDLLNAME(entry) ((UNICODE_STRING*)((BYTE*)(entry) + OFFSET_LDR_DATA_TABLE_ENTRY_BASEDLLNAME))
 //===============================================================================================//
 #endif
 //===============================================================================================// 

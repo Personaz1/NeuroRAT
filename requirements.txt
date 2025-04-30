@@ -20,4 +20,7 @@ uvicorn[standard]
 setproctitle
 numpy
 Pillow
-celery[redis] 
+mss
+celery[redis]
+mitmproxy>=10.0
+pysmbclient 

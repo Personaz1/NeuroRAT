@@ -105,7 +105,6 @@ host_scanner = HostScanner()
 vulnerability_scanner = VulnerabilityScanner()
 web3_drainer = Web3Drainer()
 web3_contract_analyzer = Web3ContractAnalyzer()
-autonomous_agent = AutonomousAgent()
 autonomous_contract_scanner = AutonomousContractScanner()
 
 # --- Redis Connection for Producer ---
