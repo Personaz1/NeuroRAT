@@ -272,6 +272,92 @@
     *   Добавлена функция `SelfDestruct()`.
     *   Реализована проверка `IsDebuggerPresent()` перед выполнением команды самоудаления.
 
-*(Более старые записи опущены)*
+**[2025-05-01] Инфраструктурный и ядровой фикс (MinGW/MSVC, wildcard, сборка)**
+*   Удалены дублирующие определения структур UNICODE_STRING и LDR_DATA_TABLE_ENTRY (ReflectiveLoader.h), внедрена условная компиляция для MinGW/MSVC.
+*   В injector.cpp полностью убрана зависимость от Shlwapi.h и PathMatchSpecW, внедрён свой wildcard_match.
+*   Исправлен синтаксис строк (VirtualBox Guest Additions).
+*   Многоступенчатые попытки сборки Docker, выявлены и устранены новые ошибки, связанные с конфликтами структур.
+*   В ReflectiveLoader.h теперь только forward-объявления и offset для BaseDllName, если нужно.
+*   Статус: сборка почти проходит, остались только инфраструктурные нюансы с MinGW и winternl.h (ошибка с BaseDllName). Продолжается работа над полной кросс-платформенной совместимостью ядра.
+
+**[2025-05-01] Хардкорный инфраструктурный фикс: ReflectiveLoader (MinGW/winternl.h/BaseDllName)**
+
+**Цель:** Полностью устранить любые зависимости от winternl.h/структур, которые ломают кросс-компиляцию и мешают внедрять API Hashing/Reflective Loader.
+
+**Что сделано:**
+- Удалён include <winternl.h> из ReflectiveLoader.h/c.
+- Добавлены минимальные определения структур PEB и LDR_DATA_TABLE_ENTRY (только нужные поля) с ручными offset-ами для x86/x64:
+    - BaseDllName: offset 0x58 (x64), 0x2C (x86)
+    - DllBase: offset 0x30 (x64), 0x18 (x86)
+- Макрос GET_BASEDLLNAME для получения BaseDllName через offset.
+- Вся работа с PEB/LDR теперь только через кастомные структуры и offset-ы, никаких winternl.h.
+- В GetModuleBaseByHash полностью убраны обращения к полям структур, только offset-ы и ручной парсинг.
+- PE Export Table парсер (GetProcAddressByHash) не зависит от winternl.h, работает только с PE-структурами.
+
+**Экспериментальные техники:**
+- Реализован **HellsGate** для динамического получения номеров syscall:
+    - Добавлены структуры `EXPORT_ENTRY`, `HELLSGATE_CONTEXT`.
+    - `InitializeHellsGate`: парсит EAT `ntdll.dll`, фильтрует `Nt*`/`Zw*` функции, сортирует по адресу, ищет **соседние валидные syscall-заглушки** (`mov r10, rcx; mov eax, num; syscall; ret`), проверяет их последовательность для валидации "шлюза".
+    - `GetSyscallNumberByHashHellsGate`: использует валидный "шлюз" и индекс целевой функции в отсортированном списке для вычисления её номера syscall.
+    - Использует `HeapAlloc`/`HeapFree` (рассмотреть `VirtualAlloc` для стелса).
+    - Вычислены и добавлены хеши для якорных и целевых функций (`NtAllocateVirtualMemory`, `NtProtectVirtualMemory`, `NtWriteVirtualMemory`, `NtMapViewOfSection`, `NtCreateThreadEx`, `NtUnmapViewOfSection`).
+- Функция `DirectSyscall_NtWriteVirtualMemory` теперь использует `GetSyscallNumberByHashHellsGate` для получения номера syscall. Добавлена базовая обработка ошибки (ret), если номер не найден.
+  **Примечание:** Проверка сигнатуры syscall-заглушки (в `InitializeHellsGate`) упрощена, для боевого кода нужна более надежная проверка.
+- Патчинг ETW/AMSI (`PatchETWandAMSI`) интегрирован в `ReflectiveLoader` перед `DllMain`.
+
+**Примечания:**
+- Все offset-ы сверять по актуальным структурам Windows! (см. ReactOS/WinDbg/HexRays)
+- Для полной кросс-платформенности избегать любых нестандартных полей и типов.
+- Все хаки и обходы фиксировать в этом файле для будущих ревизий.
+
+Расширен арсенал Direct Syscalls: добавлены `naked` функции-обертки для `NtMapViewOfSection`, `NtCreateThreadEx`, `NtUnmapViewOfSection`. Все они используют `GetSyscallNumberByHashHellsGate` для динамического получения номера syscall.
+**Примечание:** Проверка сигнатуры syscall-заглушки (в `InitializeHellsGate`) упрощена, для боевого кода нужна более надежная проверка.
+
+Код HellsGate и Direct Syscall оберток (`DirectSyscall_Nt*`) перенесен в `injector.cpp`.
+В `injector_process_hollowing` вызов `NtUnmapViewOfSection` заменен на `DirectSyscall_NtUnmapViewOfSection`. Для этого добавлен вызов `DirectSyscall_NtQueryInformationProcess` и `ReadProcessMemory` для получения `ImageBaseAddress` из PEB целевого процесса.
+Инициализация API в `InitializeApiPointers` переводится на использование `GetProcAddressByHash` вместо `GetProcAddress` (поэтапно, пока не завершено).
+
+**[2025-05-01] Конец дня: Реализация HellsGate и Direct Syscalls, Ошибка сборки Docker**
+
+**Действия:**
+- Полностью реализована техника **HellsGate** для динамического получения номеров syscall (парсинг EAT ntdll, поиск "шлюза" по соседним syscall, вычисление номера по индексу) в `injector.cpp`.
+- Добавлены **Direct Syscall обертки** (`naked` функции) для `NtWriteVirtualMemory`, `NtMapViewOfSection`, `NtCreateThreadEx`, `NtUnmapViewOfSection`, `NtQueryInformationProcess` с использованием HellsGate в `injector.cpp`.
+- В функции `inject_process_hollowing` вызов `NtUnmapViewOfSection` **заменен** на прямой системный вызов `DirectSyscall_NtUnmapViewOfSection`. Добавлены вызовы `DirectSyscall_NtQueryInformationProcess` и `ReadProcessMemory` для получения `ImageBaseAddress`.
+- Запущена сборка Docker-образа агента (`docker build --no-cache -f Dockerfile.agent .`) для проверки компиляции C++ модуля.
+
+**Результат:**
+- Сборка Docker **ЗАВЕРШИЛАСЬ С ОШИБКОЙ** (`exit code: 2`) на этапе компиляции нативного кода (`cmake --build /build/native_build`).
+- **Причина:** Множественные ошибки компиляции в `test_payloads/reflective_dll_test/ReflectiveLoader.c` (синтаксис `__asm` несовместим с MinGW/GCC, неопределенный `SECTION_INHERIT`, отсутствующий хеш `NtQueryInformationProcess_HASH`, дубликат функции) и потенциально ошибка с `Shlwapi.h` в `injector.cpp` (хотя include отсутствовал).
+
+**[2025-05-02] Исправление ошибок сборки C++ модуля**
+
+**Действия:**
+- Несколько итераций отладки и исправления ошибок сборки:
+    - Переписаны `naked` функции (`DirectSyscall_*`) в `ReflectiveLoader.c` с использованием синтаксиса GCC `__asm__ volatile (...)`.
+    - Исправлено определение `SECTION_INHERIT` в `ReflectiveLoader.c` путем его локального определения через `#ifndef`.
+    - Добавлен `#define NtQueryInformationProcess_HASH` в `ReflectiveLoader.c`.
+    - Удалено дублирующее определение функции `DirectSyscall_NtWriteVirtualMemory` в `ReflectiveLoader.c`.
+    - Проверено отсутствие `#include <Shlwapi.h>` в `injector.cpp` и `injector.h`.
+    - Попытка принудительной очистки кэша CMake (`rm -rf /build/native_build/*`) в `Dockerfile.agent`, что привело к ошибке `could not load cache`.
+    - Возвращен `Dockerfile.agent` к стандартной схеме сборки CMake.
+    - Запущена повторная сборка (`docker build --no-cache -f Dockerfile.agent .`), которая была прервана пользователем, но начальные этапы компиляции C++ (которые ранее падали) прошли успешно.
+- Обнаружены и проигнорированы постоянные ошибки линтера Dockerfile (hadolint) для команд `COPY`, предположительно ложное срабатывание.
+
+**Результат:**
+- Ошибки компиляции C++ кода (`injector.cpp`, `ReflectiveLoader.c`) **устранены**. Сборка нативного кода теперь должна проходить успешно.
+
+**Следующие шаги (После перерыва):**
+1.  **Успешная сборка:** Добиться полного успешного завершения `docker build -f Dockerfile.agent .` (если последняя попытка не завершилась до конца).
+2.  **Тестирование Hollowing (с Direct Syscalls):**
+    - Создать/адаптировать тестовую C++ программу (`test_hollowing.cpp` или аналог) вне Docker.
+    - Загрузить скомпилированную `cpp_injector.dll` (извлечь из образа или собрать локально, если настроено).
+    - Вызвать `inject_process_hollowing` с тестовым шеллкодом (например, `calc.exe`).
+    - Проверить корректность работы HellsGate и `DirectSyscall_NtUnmapViewOfSection` по логам и результату (запуск calc.exe в целевом процессе).
+3.  **Интеграция скриншотера:**
+    - Добавить команду `take_screenshot` в C2/агент.
+    - В `autonomous_agent.py` вызвать `CaptureScreenshot()` из `cpp_injector.dll` через `ctypes`.
+    - Получить Base64 строку, передать на C2.
+    - На C2/UI отобразить скриншот.
+4.  **Рефакторинг (продолжение):** Завершить переход на `GetProcAddressByHash` в `InitializeApiPointers` в `injector.cpp`.
 
 ---

@@ -62,13 +62,13 @@ COPY test_payloads/reflective_dll_test/ /build/test_payloads/reflective_dll_test
 # Correct path for the toolchain file
 COPY src/native/cpp_injector/mingw-w64-toolchain.cmake /build/build/cmake/
 
-# Configure and build using CMake with MinGW toolchain
-# Ensure the build directory for CMake exists before running cmake command
+# Build native code configuration
 RUN mkdir -p /build/native_build && \
     cmake \
     -S /build/src/native/ \
     -B /build/native_build \
     -DCMAKE_TOOLCHAIN_FILE=/build/build/cmake/mingw-w64-toolchain.cmake && \
+    echo "Running cmake --build..." && \
     cmake --build /build/native_build --config Release --parallel $(nproc)
 
 # Stage 2: Build Python components and create final image
@@ -83,7 +83,10 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 COPY . /app
 
 # Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# RUN pip install --no-cache-dir -r requirements.txt # Already done earlier
+
+# Создаем директории перед копированием
+RUN mkdir -p /app/bin /app/payloads
 
 # Copy compiled native components from the native-builder stage
 COPY --from=native-builder /build/native_build/cpp_injector/lib/cpp_injector.dll /app/src/native/cpp_injector/build/lib/

