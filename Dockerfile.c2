@@ -40,6 +40,6 @@ COPY src/ /app/src/
 EXPOSE 8000
 
 # Запускаем C2 сервер из /app/src
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "c2_server.c2_server:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
 # Используем --reload для удобства разработки, чтобы сервер перезапускался при изменениях кода
 # В продакшене --reload нужно убрать 
