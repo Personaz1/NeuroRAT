@@ -1,24 +1,35 @@
-# Ignore environment files
+# Environment files
+.env
 agentx-c1/.env
-# CLAUDE coding best practices
-# CLAUDE_CODING_BEST_PRACTICES.md
-# Legacy notes are now tracked
-# Игнорировать папку с устаревшими файлами (legacy)
-OLD FILES (ANALIZE&Intagrate))/
-.cursor/
+
+# OS-specific files
 .DS_Store
+
+# Python cache/artefacts
 **/__pycache__/
 *.pyc
-*.log
-.env
-# Игнорировать локальные заметки разработки
-# Dev_Notes.md
-# DEV_NOTES.md
-# secret_dev_notes.md
+venv/
 
-# Development notes
+# Logs
+*.log
+
+# Development notes & Project files (Keep these local)
 DEV_NOTES.md
 secret_dev_notes.md
 dev-notes.md
 DEVELOPMENT_PLAN.md
 CLAUDE_CODING_BEST_PRACTICES.md
+
+# IDE specific
+.vscode/
+.cursor/
+
+# Build artifacts
+build/
+
+# Legacy files (Analyze & Integrate separately)
+OLD FILES (ANALIZE&Intagrate))/
+
+# Other
+.pytest_cache/
+cache/ # If this is a cache directory that shouldn't be committed
