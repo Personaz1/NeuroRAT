@@ -1,156 +1,18 @@
-# AgentX / NeuroRAT
+# NeuroRAT — Archived Legacy Research
 
-AgentX - многофункциональная платформа для кибербезопасности с возможностями автономного ИИ-агента, сканирования уязвимостей и эксплуатации.
+> **Archive notice:** This repository is a historical snapshot of a broader security-research codebase. It contains dual-use components, including remote-agent, exploitation and cryptocurrency-draining functionality. It is not a deployable product.
 
-## Функциональные возможности
+## Repository context
+The codebase combines material from earlier AgentX/NeuroRAT experiments. Its historical structure includes server/agent components, web interfaces, network tooling and experimental automation. Some components are harmful outside a tightly controlled and authorized environment.
 
-### Основные компоненты
-- **C2 Server** - Центр управления и контроля для всех агентов и операций
-- **Exploit Engine** - Модуль для автоматической эксплуатации уязвимостей
-- **Web3 Drainer** - Криптовалютные дрейнеры и MEV-инструменты
-- **Autonomous Agent** - ИИ-управляемый автономный агент для разведки и эксплуатации
+## Status
+Archived legacy snapshot. No active maintenance, release assurance, compatibility guarantee or operational support. The repository should not be deployed or connected to public targets, wallets, accounts or third-party infrastructure.
 
-### Технические характеристики
-- Микросервисная архитектура для масштабируемости
-- RESTful API и WebSocket для коммуникации
-- React + Chakra UI для административной панели
-- Тонкая настройка агрессивности и анонимизации
+## Safety boundary
+Do not use this code for unauthorized access, credential theft, persistence, evasion, data exfiltration, financial theft or disruption. Defensive analysis, if undertaken, must use isolated lab infrastructure, synthetic credentials and test assets under explicit authorization.
 
-## Установка
+## Documentation policy
+This README is an archival and provenance notice. It intentionally removes quick-start, deployment and operational guidance. Historical source and commit history remain unchanged.
 
-### Требования
-- Python 3.10+
-- Node.js 16+
-- Docker и Docker Compose (опционально)
-
-### Быстрый старт
-
-#### Установка с использованием Docker
-
-1. Клонировать репозиторий:
-```bash
-git clone https://github.com/username/agentx.git
-cd agentx
-```
-
-2. Собрать и запустить с Docker:
-```bash
-docker-compose up -d
-```
-
-3. Открыть в браузере:
-```
-http://localhost:80
-```
-
-#### Ручная установка
-
-1. Установка бэкенда:
-```bash
-pip install -r requirements.txt
-cd src
-python -m main
-```
-
-2. Установка фронтенда:
-```bash
-cd agentx-ui
-npm install
-npm run dev
-```
-
-## Использование
-
-### C2 Server
-
-1. Запустите C2 сервер:
-```bash
-python -m src.main
-```
-
-2. Сервер будет доступен по адресу `http://localhost:8000/`
-
-### Web3 Drainer
-
-Web3 Drainer - это мощный модуль для работы с криптовалютами:
-
-1. Конфигурация через административную панель:
-   - Выберите блокчейн (Ethereum, BSC, Polygon, и т.д.)
-   - Укажите кошелек-получатель
-   - Добавьте приватные ключи для дрейна
-
-2. Функциональность:
-   - Автоматическое извлечение нативной криптовалюты
-   - Поддержка ERC-20 токенов и NFT
-   - MEV-функциональность (фронтраннинг и сэндвич-атаки)
-   - Анонимизация транзакций
-
-### Autonomous Agent
-
-Автономный агент для автоматизированной разведки и эксплуатации:
-
-1. Настройка параметров:
-   - Укажите диапазон целей (IP, домены, CIDR)
-   - Выберите цель операции (разведка, сканирование, эксплуатация)
-   - Настройте уровень агрессивности
-
-2. Работа агента:
-   - Автоматический сбор информации о целях
-   - Обнаружение уязвимостей и их эксплуатация
-   - Сбор криптовалютных активов (при выборе соответствующей цели)
-
-## Архитектура
-
-```
-AgentX
-├── src/                      # Исходный код бэкенда
-│   ├── modules/              # Основные модули
-│   │   ├── web3_drainer.py   # Криптовалютный дрейнер
-│   │   ├── stego_tunnel.py   # Стеганографический туннель
-│   │   └── ...
-│   ├── exploit_engine.py     # Движок эксплойтов
-│   ├── autonomous_agent.py   # Автономный ИИ-агент
-│   └── main.py               # Главный C2 сервер
-├── agentx-ui/                # React фронтенд
-├── Dockerfile                # Docker конфигурация
-└── requirements.txt          # Python зависимости
-```
-
-## Безопасность
-
-**ВНИМАНИЕ**: Данный инструментарий предназначен ТОЛЬКО для авторизованного тестирования безопасности. Использование без явного разрешения владельцев системы является незаконным.
-
-## Разработка
-
-1. Запуск в режиме разработки:
-```bash
-# Бэкенд
-python -m src.main --debug
-
-# Фронтенд
-cd agentx-ui
-npm run dev
-```
-
-2. Сборка для продакшена:
-```bash
-# Фронтенд
-cd agentx-ui
-npm run build
-
-# Запуск в Docker
-docker-compose up -d --build
-```
-
-## Расширение функциональности
-
-Для добавления новых модулей:
-
-1. Создайте новый Python-модуль в `src/modules/`
-2. Добавьте интеграцию с C2-сервером в `src/main.py`
-3. Добавьте UI-компонент в `agentx-ui/src/pages/`
-4. Обновите маршрутизацию в `agentx-ui/src/App.tsx`
-
-## Лицензия
-
-Этот проект распространяется под лицензией [MIT License](LICENSE). 
+## License
+See LICENSE. Licensing does not authorize harmful or unlawful use.
