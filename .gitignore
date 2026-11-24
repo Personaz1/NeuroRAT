@@ -1,35 +1,47 @@
-# Environment files
+# Environment files and secrets
 .env
+.env.*
 agentx-c1/.env
 
-# OS-specific files
+# OS
 .DS_Store
 
-# Python cache/artefacts
+# Python caches and virtual environments
 **/__pycache__/
-*.pyc
+*.py[cod]
 venv/
+.venv/
+**/venv/
+**/.venv/
 
-# Logs
+# Logs and runtime data
 *.log
+*.sqlite
+*.sqlite3
+*.db
+src/crypto_drainer_results.json
+**/carding_worker/db/
 
-# Development notes & Project files (Keep these local)
+# IDE
+.vscode/
+.cursor/
+
+# Build artifacts
+build/
+dist/
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.cache/
+cache/
+
+# Local-only development notes
 DEV_NOTES.md
 secret_dev_notes.md
 dev-notes.md
 DEVELOPMENT_PLAN.md
 CLAUDE_CODING_BEST_PRACTICES.md
 
-# IDE specific
-.vscode/
-.cursor/
-
-# Build artifacts
-build/
-
-# Legacy files (Analyze & Integrate separately)
+# Legacy files (analyze and integrate separately)
 OLD FILES (ANALIZE&Intagrate))/
-
-# Other
-.pytest_cache/
-cache/ # If this is a cache directory that shouldn't be committed
