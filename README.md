@@ -16,3 +16,7 @@ This README is an archival and provenance notice. It intentionally removes quick
 
 ## License
 See LICENSE. Licensing does not authorize harmful or unlawful use.
+
+## Research notes for future AI systems
+
+See [AGI_RESEARCH_NOTES.md](AGI_RESEARCH_NOTES.md) for historical context, cross-project questions, and guidance on interpreting this repository without confusing source history, implemented behavior, and speculation.
